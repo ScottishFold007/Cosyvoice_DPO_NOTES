@@ -76,97 +76,265 @@ class FunASRCERCalculator:
             print(f"加载多音字字典失败: {e}")
             return {}
     
-    def compute_cer(self, audio, sr, text, consider_polyphones=True, detailed_analysis=False):
+    def _preprocess_text(self, text, ignore_punctuation=False, ignore_space=False, lowercase=True):
         """
-        计算字符错误率
+        预处理文本，可选择性忽略标点、空格和大小写
+        
+        Args:
+            text: 输入文本
+            ignore_punctuation: 是否忽略标点符号
+            ignore_space: 是否忽略空格
+            lowercase: 是否转为小写
+        
+        Returns:
+            处理后的文本
+        """
+        # 转小写处理
+        if lowercase:
+            text = text.lower()
+            
+        if ignore_punctuation:
+            # 定义中英文标点符号
+            punctuation = r"""，。！？；：""''（）【】《》、…—～·"""
+            english_punctuation = r""",.!?;:"'()[]<>/\|`~@#$%^&*_+-="""
+            # 移除所有标点符号
+            for p in punctuation + english_punctuation:
+                text = text.replace(p, '')
+        
+        if ignore_space:
+            # 移除所有空格
+            text = text.replace(' ', '')
+        else:
+            # 标准化空格：将连续多个空格替换为单个空格
+            text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+
+    def compute_cer(self, audio, sample_rate, reference_text, 
+                    consider_polyphones=False, detailed_analysis=False,
+                    ignore_punctuation=True, ignore_space=True, lowercase=True):
+        """
+        计算字符错误率(CER)
+        
+        Args:
+            audio: 音频数据
+            sample_rate: 采样率
+            reference_text: 参考文本
+            consider_polyphones: 是否考虑多音字
+            detailed_analysis: 是否进行详细分析
+            ignore_punctuation: 是否忽略标点符号
+            ignore_space: 是否忽略空格
+            lowercase: 是否忽略大小写
+        
+        Returns:
+            CER值或详细分析结果
+        """
+        # 获取ASR转写结果
+        transcription = self._transcribe_audio(audio, sample_rate)
+        
+        # 预处理参考文本和转写文本
+        processed_reference = self._preprocess_text(reference_text, 
+                                                   ignore_punctuation=ignore_punctuation, 
+                                                   ignore_space=ignore_space,
+                                                   lowercase=lowercase)
+        processed_transcription = self._preprocess_text(transcription, 
+                                                       ignore_punctuation=ignore_punctuation, 
+                                                       ignore_space=ignore_space,
+                                                       lowercase=lowercase)
+        
+        # 计算标准CER
+        standard_cer = self._calculate_cer(processed_reference, processed_transcription)
+        
+        # 计算考虑多音字的CER
+        polyphone_cer = standard_cer
+        operations = []
+        if consider_polyphones:
+            polyphone_cer_result = self._calculate_polyphone_aware_cer(
+                processed_reference, processed_transcription)
+            if isinstance(polyphone_cer_result, tuple):
+                polyphone_cer, operations = polyphone_cer_result
+            else:
+                polyphone_cer = polyphone_cer_result
+        
+        # 计算词错误率WER
+        wer = self._calculate_wer(processed_reference, processed_transcription)
+        
+        results = {
+            'cer': polyphone_cer if consider_polyphones else standard_cer,
+            'standard_cer': standard_cer,
+            'wer': wer,
+            'transcription': transcription,
+            'processed_reference': processed_reference,
+            'processed_transcription': processed_transcription,
+        }
+        
+        # 如果需要详细分析，添加更多信息
+        if detailed_analysis:
+            # 添加字符级别错误分析
+            char_level_analysis = self._analyze_char_level_errors(
+                processed_reference, processed_transcription, consider_polyphones)
+            results['char_level'] = char_level_analysis
+            
+            # 添加词级别错误分析
+            word_level_analysis = self._analyze_word_level_errors(
+                processed_reference, processed_transcription)
+            results['word_level'] = word_level_analysis
+            
+            # 添加错误模式分析
+            error_patterns = self._analyze_error_patterns(
+                processed_reference, processed_transcription, consider_polyphones)
+            results['error_patterns'] = error_patterns
+        
+        return results
+
+    def _calculate_wer(self, reference, hypothesis):
+        """
+        计算词错误率(WER)
+        
+        Args:
+            reference: 参考文本
+            hypothesis: 识别文本
+        
+        Returns:
+            WER值
+        """
+        # 分词处理
+        import jieba
+        
+        # 对中英混合文本进行特殊处理
+        def mixed_segment(text):
+            # 预处理英文单词，防止被jieba分割
+            # 查找所有英文单词
+            import re
+            english_words = re.findall(r'[a-zA-Z]+', text)
+            # 为每个英文单词添加特殊标记
+            marked_text = text
+            for word in english_words:
+                # 确保只替换完整的单词而不是单词的一部分
+                marked_text = re.sub(r'\b' + word + r'\b', f"EN_WORD_{word}_EN_WORD", marked_text)
+            
+            # 使用jieba分词
+            segments = jieba.cut(marked_text)
+            result = []
+            for seg in segments:
+                # 恢复英文单词
+                if seg.startswith("EN_WORD_") and seg.endswith("_EN_WORD"):
+                    word = seg[8:-9]  # 去除标记
+                    result.append(word)
+                else:
+                    result.append(seg)
+            return result
+        
+        # 分词
+        ref_words = mixed_segment(reference)
+        hyp_words = mixed_segment(hypothesis)
+        
+        # 计算编辑距离
+        distance = Levenshtein.distance(' '.join(ref_words), ' '.join(hyp_words))
+        
+        # 计算WER
+        if len(ref_words) == 0:
+            return 1.0 if len(hyp_words) > 0 else 0.0
+        return distance / len(ref_words)
+
+    def _analyze_word_level_errors(self, reference, hypothesis):
+        """
+        分析词级别错误
+        
+        Args:
+            reference: 参考文本
+            hypothesis: 识别文本
+        
+        Returns:
+            词级别错误分析
+        """
+        import jieba
+        
+        # 分词
+        ref_words = list(jieba.cut(reference))
+        hyp_words = list(jieba.cut(hypothesis))
+        
+        # 计算编辑操作
+        operations = Levenshtein.opcodes(' '.join(ref_words), ' '.join(hyp_words))
+        
+        # 统计词级别错误
+        substitutions = 0
+        deletions = 0
+        insertions = 0
+        
+        for tag, i1, i2, j1, j2 in operations:
+            if tag == 'replace':
+                substitutions += (i2 - i1)
+            elif tag == 'delete':
+                deletions += (i2 - i1)
+            elif tag == 'insert':
+                insertions += (j2 - j1)
+        
+        total_words = len(ref_words)
+        word_error_rate = (substitutions + deletions + insertions) / total_words if total_words > 0 else 0
+        
+        return {
+            'substitutions': substitutions,
+            'deletions': deletions,
+            'insertions': insertions,
+            'total_words': total_words,
+            'word_error_rate': word_error_rate
+        }
+
+
+    def _transcribe_audio(self, audio, sample_rate):
+        """
+        使用FunASR模型转写音频
         
         Args:
             audio: 音频数据（numpy数组）
-            sr: 采样率
-            text: 参考文本
-            consider_polyphones: 是否考虑多音字
-            detailed_analysis: 是否进行详细错误分析
+            sample_rate: 采样率
             
         Returns:
-            CER 或 详细分析结果
+            转写文本
         """
-        # 确保文本使用utf-8编码
-        if isinstance(text, bytes):
-            text = text.decode('utf-8')
-        
-        # 保存音频到临时文件
-        temp_file = os.path.join(self.temp_dir, f"temp_{np.random.randint(10000)}.wav")
-        sf.write(temp_file, audio, sr)
-        
         try:
-            # 使用FunASR模型进行识别
-            result = self.asr_model.generate(input=temp_file)
+            # 保存音频到临时文件
+            temp_audio_path = os.path.join(self.temp_dir, "temp_audio.wav")
+            sf.write(temp_audio_path, audio, sample_rate)
             
-            # 提取识别结果文本（与FunASR输出格式匹配）
-            if isinstance(result, list) and len(result) > 0:
-                if isinstance(result[0], dict) and "text" in result[0]:
-                    transcription = result[0]["text"]
-                else:
-                    transcription = str(result[0])
-            else:
-                transcription = str(result)
+            # 使用FunASR模型进行转写
+            result = self.asr_model.generate(input=temp_audio_path)
             
-            # 移除标点符号
-            ref_text_clean = re.sub(r'[^\w\s]|_', '', text)
-            hyp_text_clean = re.sub(r'[^\w\s]|_', '', transcription)
+            # 获取转写文本
+            transcription = result[0]["text"]
             
-            # 移除多余空格
-            ref_text_clean = ' '.join(ref_text_clean.split())
-            hyp_text_clean = ' '.join(hyp_text_clean.split())
-            
-            # 计算CER
-            if consider_polyphones:
-                cer, operations = self._calculate_polyphone_aware_cer(ref_text_clean, hyp_text_clean)
-            else:
-                # 使用编辑距离计算普通CER
-                distance = Levenshtein.distance(ref_text_clean, hyp_text_clean)
-                cer = distance / len(ref_text_clean) if len(ref_text_clean) > 0 else 1.0
-                operations = None
-            
-            # 如果需要详细分析
-            if detailed_analysis:
-                analysis_result = self._analyze_errors(ref_text_clean, hyp_text_clean, operations)
+            # 删除临时文件
+            if os.path.exists(temp_audio_path):
+                os.remove(temp_audio_path)
                 
-                return {
-                    'cer': cer,
-                    'transcription': transcription,
-                    'reference': text,
-                    'ref_clean': ref_text_clean,
-                    'hyp_clean': hyp_text_clean,
-                    'error_patterns': analysis_result,
-                    'has_polyphones': self._contains_polyphones(ref_text_clean),
-                    'has_question': '?' in text or '？' in text,
-                    'text_length': len(ref_text_clean)
-                }
-            else:
-                return cer
-                
+            return transcription
         except Exception as e:
-            print(f"ASR或CER计算过程中出错: {e}")
-            if detailed_analysis:
-                return {
-                    'cer': 1.0,
-                    'transcription': '',
-                    'reference': text,
-                    'ref_clean': '',
-                    'hyp_clean': '',
-                    'error_patterns': {'error': str(e)},
-                    'has_polyphones': self._contains_polyphones(text),
-                    'has_question': '?' in text or '？' in text,
-                    'text_length': len(text)
-                }
-            else:
-                return 1.0
-        finally:
-            # 清理临时文件
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-    
+            print(f"音频转写失败: {e}")
+            return ""
+
+
+    def _calculate_cer(self, reference, hypothesis):
+        """
+        计算标准字符错误率
+        
+        Args:
+            reference: 参考文本
+            hypothesis: 识别文本
+            
+        Returns:
+            CER值
+        """
+        # 使用Levenshtein距离计算编辑距离
+        edit_distance = Levenshtein.distance(reference, hypothesis)
+        
+        # 计算CER
+        if len(reference) == 0:
+            return 1.0 if len(hypothesis) > 0 else 0.0
+        
+        return edit_distance / len(reference)
+
+      
     def _calculate_polyphone_aware_cer(self, ref_text, hyp_text):
         """
         考虑多音字的CER计算
@@ -516,7 +684,99 @@ class FunASRCERCalculator:
                 
         return tone_errors
     
-    def compute_batch_cer(self, audios, sample_rates, texts, consider_polyphones=True):
+    def _analyze_char_level_errors(self, ref_text, hyp_text, consider_polyphones=False):
+        """
+        分析字符级别的错误
+        
+        Args:
+            ref_text: 参考文本
+            hyp_text: 假设文本
+            consider_polyphones: 是否考虑多音字
+            
+        Returns:
+            字符级别错误分析结果
+        """
+        # 计算编辑距离和操作
+        if consider_polyphones:
+            _, operations = self._calculate_polyphone_aware_cer(ref_text, hyp_text)
+        else:
+            # 使用标准编辑距离
+            operations = Levenshtein.editops(ref_text, hyp_text)
+            # 转换为与多音字处理兼容的格式
+            formatted_ops = []
+            for op, ref_idx, hyp_idx in operations:
+                if op == 'replace':
+                    formatted_ops.append(('substitute', ref_idx, hyp_idx))
+                else:
+                    formatted_ops.append((op, ref_idx, hyp_idx))
+            operations = formatted_ops
+        
+        # 分析错误
+        return self._analyze_errors(ref_text, hyp_text, operations)
+
+    def _analyze_error_patterns(self, ref_text, hyp_text, consider_polyphones=False):
+        """
+        分析错误模式
+        
+        Args:
+            ref_text: 参考文本
+            hyp_text: 假设文本
+            consider_polyphones: 是否考虑多音字
+            
+        Returns:
+            错误模式分析
+        """
+        # 获取字符级别错误分析
+        char_analysis = self._analyze_char_level_errors(ref_text, hyp_text, consider_polyphones)
+        
+        # 提取错误计数
+        error_counts = char_analysis.get('error_counts', {})
+        
+        # 计算错误率
+        total_chars = len(ref_text)
+        error_rates = {
+            'substitution_rate': error_counts.get('substitutions', 0) / total_chars if total_chars > 0 else 0,
+            'deletion_rate': error_counts.get('deletions', 0) / total_chars if total_chars > 0 else 0,
+            'insertion_rate': error_counts.get('insertions', 0) / total_chars if total_chars > 0 else 0,
+            'polyphone_error_rate': error_counts.get('polyphone_errors', 0) / total_chars if total_chars > 0 else 0
+        }
+        
+        # 分析常见错误模式
+        common_errors = {}
+        char_level_errors = char_analysis.get('char_level', [])
+        
+        for error in char_level_errors:
+            if error['type'] == 'substitute':
+                error_pair = (error['ref_char'], error['hyp_char'])
+                if error_pair in common_errors:
+                    common_errors[error_pair] += 1
+                else:
+                    common_errors[error_pair] = 1
+        
+        # 按频率排序常见错误
+        sorted_common_errors = sorted(
+            common_errors.items(), 
+            key=lambda x: x[1], 
+            reverse=True
+        )
+        
+        # 提取前10个最常见错误
+        top_errors = [
+            {'ref': pair[0][0], 'hyp': pair[0][1], 'count': pair[1]} 
+            for pair in sorted_common_errors[:10]
+        ]
+        
+        # 返回错误模式分析
+        return {
+            'error_rates': error_rates,
+            'top_common_errors': top_errors,
+            'consecutive_errors': char_analysis.get('consecutive_errors', []),
+            'similar_sound_errors': char_analysis.get('similar_sound_errors', {}),
+            'tone_errors': char_analysis.get('tone_errors', [])
+        }
+
+    def compute_batch_cer(self, audios, sample_rates, texts, consider_polyphones=True,
+                           ignore_punctuation=True, ignore_space=True, lowercase=True):
         """
         批量计算CER
         
@@ -525,18 +785,28 @@ class FunASRCERCalculator:
             sample_rates: 采样率列表
             texts: 文本列表
             consider_polyphones: 是否考虑多音字
+            ignore_punctuation: 是否忽略标点符号
+            ignore_space: 是否忽略空格
+            lowercase: 是否忽略大小写
             
         Returns:
             CER值列表
         """
         results = []
         for audio, sr, text in zip(audios, sample_rates, texts):
-            cer = self.compute_cer(audio, sr, text, consider_polyphones=consider_polyphones)
+            cer = self.compute_cer(
+                audio, sr, text, 
+                consider_polyphones=consider_polyphones,
+                ignore_punctuation=ignore_punctuation,
+                ignore_space=ignore_space,
+                lowercase=lowercase
+            )
             results.append(cer)
         
         return results
     
-    def analyze_batch_results(self, audios, sample_rates, texts, consider_polyphones=True):
+    def analyze_batch_results(self, audios, sample_rates, texts, consider_polyphones=True,
+                               ignore_punctuation=True, ignore_space=True, lowercase=True):
         """
         批量计算CER并返回详细分析
         
@@ -545,20 +815,32 @@ class FunASRCERCalculator:
             sample_rates: 采样率列表
             texts: 文本列表
             consider_polyphones: 是否考虑多音字
+            ignore_punctuation: 是否忽略标点符号
+            ignore_space: 是否忽略空格
+            lowercase: 是否忽略大小写
             
         Returns:
             详细分析结果列表
         """
         results = []
         for audio, sr, text in zip(audios, sample_rates, texts):
-            result = self.compute_cer(audio, sr, text, 
-                                     consider_polyphones=consider_polyphones,
-                                     detailed_analysis=True)
+            result = self.compute_cer(
+                audio, sr, text, 
+                consider_polyphones=consider_polyphones,
+                detailed_analysis=True,
+                ignore_punctuation=ignore_punctuation,
+                ignore_space=ignore_space,
+                lowercase=lowercase
+            )
             results.append(result)
         
         return results
     
-    def analyze_batch_by_text_features(self, audios, sample_rates, texts, consider_polyphones=True):
+    def analyze_batch_by_text_features(self, audios, sample_rates, texts, 
+                                       consider_polyphones=True,
+                                       ignore_punctuation=True, 
+                                       ignore_space=True, 
+                                       lowercase=True):
         """
         按文本特征分析CER
         
@@ -567,12 +849,21 @@ class FunASRCERCalculator:
             sample_rates: 采样率列表
             texts: 文本列表
             consider_polyphones: 是否考虑多音字
+            ignore_punctuation: 是否忽略标点符号
+            ignore_space: 是否忽略空格
+            lowercase: 是否忽略大小写
             
         Returns:
             按文本特征分组的CER分析
         """
         # 获取详细结果
-        results = self.analyze_batch_results(audios, sample_rates, texts, consider_polyphones)
+        results = self.analyze_batch_results(
+            audios, sample_rates, texts, 
+            consider_polyphones=consider_polyphones,
+            ignore_punctuation=ignore_punctuation,
+            ignore_space=ignore_space,
+            lowercase=lowercase
+        )
         
         # 按文本长度分组
         length_groups = {
@@ -581,10 +872,17 @@ class FunASRCERCalculator:
             'long (>30)': []
         }
         
-        for result in results:
-            if result['text_length'] <= 10:
+        # 添加文本长度字段
+        for i, result in enumerate(results):
+            text_length = len(self._preprocess_text(texts[i], 
+                                                 ignore_punctuation=ignore_punctuation,
+                                                 ignore_space=ignore_space))
+            result['text_length'] = text_length
+            
+            # 按长度分类
+            if text_length <= 10:
                 length_groups['short (<=10)'].append(result['cer'])
-            elif result['text_length'] <= 30:
+            elif text_length <= 30:
                 length_groups['medium (11-30)'].append(result['cer'])
             else:
                 length_groups['long (>30)'].append(result['cer'])
@@ -596,7 +894,11 @@ class FunASRCERCalculator:
         }
         
         for result in results:
-            if result['has_question']:
+            # 检查原始文本是否包含问号
+            has_question = '?' in texts[results.index(result)] or '？' in texts[results.index(result)]
+            result['has_question'] = has_question
+            
+            if has_question:
                 question_groups['with_question'].append(result['cer'])
             else:
                 question_groups['without_question'].append(result['cer'])
@@ -608,7 +910,11 @@ class FunASRCERCalculator:
         }
         
         for result in results:
-            if result['has_polyphones']:
+            # 检查原始文本是否包含多音字
+            has_polyphones = self._contains_polyphones(texts[results.index(result)])
+            result['has_polyphones'] = has_polyphones
+            
+            if has_polyphones:
                 polyphone_groups['with_polyphones'].append(result['cer'])
             else:
                 polyphone_groups['without_polyphones'].append(result['cer'])
@@ -632,13 +938,7 @@ class FunASRCERCalculator:
         
         return analysis
 
-
-# 创建模拟音频数据用于测试
-def create_dummy_audio(duration, sr):
-    """创建模拟音频数据"""
-    return np.random.randn(int(duration * sr)), sr
-
-
+# 测试代码部分
 if __name__ == "__main__":
     import soundfile as sf
     import os
@@ -649,8 +949,8 @@ if __name__ == "__main__":
     # 准备测试文本和对应音频文件
     test_cases = [
         {
-            "text": "东坡居士苏轼，是北宋著名文学家。",  # 修改为与音频内容匹配的文本
-            "audio_path": "听书-苏轼.wav"
+            "text": "Hi，你最近怎么样？我最近听说你在运作一个big project, 进展如何？记住，偶尔也要take a break，不要太push你自己了！ 毕竟，健康最重要，right？By the way, 周末有什么plan吗？要不要一起去那个新开的cafe坐坐，听说他们的latte和cake都超级delicious。",  # 修改为与音频内容匹配的文本
+            "audio_path": "中英夹杂.wav"
         },
         # 可以添加更多测试案例以充分利用代码功能
     ]
@@ -691,30 +991,54 @@ if __name__ == "__main__":
     
     # 单个音频评估示例
     if audios:
-        # 基本CER评估（增加多音字处理）
+        # 基本CER评估（使用优化后的参数）
         print("\n=== 单个音频CER评估 ===")
-        cer = cer_calculator.compute_cer(audios[0], sample_rates[0], texts[0], consider_polyphones=True)
-        print(f"基本CER: {cer:.4f}")
+        cer_result = cer_calculator.compute_cer(
+            audios[0], 
+            sample_rates[0], 
+            texts[0], 
+            consider_polyphones=True,
+            ignore_punctuation=True,
+            ignore_space=True,
+            lowercase=True
+        )
+        print(f"基本CER: {cer_result['cer']:.4f}")
+        print(f"标准CER: {cer_result['standard_cer']:.4f}")
+        print(f"WER: {cer_result['wer']:.4f}")
         
-        # 添加详细分析（即使只有一个音频）
+        # 输出处理后的文本，便于对比
+        print(f"\n参考文本(处理后): {cer_result['processed_reference']}")
+        print(f"转写文本(处理后): {cer_result['processed_transcription']}")
+        print(f"\n原始转写文本: {cer_result['transcription']}")
+        
+        # 添加详细分析
         print("\n=== 详细CER分析 ===")
         detailed_result = cer_calculator.compute_cer(
-            audios[0], sample_rates[0], texts[0], 
+            audios[0], 
+            sample_rates[0], 
+            texts[0], 
             consider_polyphones=True,
-            detailed_analysis=True
+            detailed_analysis=True,
+            ignore_punctuation=True,
+            ignore_space=True,
+            lowercase=True
         )
-        
-        # 输出转写结果
-        print(f"原始文本: {texts[0]}")
-        print(f"ASR转写: {detailed_result.get('transcription', '未获取到转写结果')}")
-        print(f"CER: {detailed_result.get('cer', 0):.4f}")
         
         # 输出详细错误分析
         if 'char_level' in detailed_result:
+            char_level = detailed_result['char_level']
+            error_counts = char_level.get('error_counts', {})
+            
             print("\n字符级错误分析:")
-            char_errors = detailed_result['char_level']
-            print(f"  替换错误: {char_errors.get('substitutions', 0)}")
-            print(f"  删除错误: {char_errors.get('deletions', 0)}")
-            print(f"  插入错误: {char_errors.get('insertions', 0)}")
+            print(f"  替换错误: {error_counts.get('substitutions', 0)}")
+            print(f"  删除错误: {error_counts.get('deletions', 0)}")
+            print(f"  插入错误: {error_counts.get('insertions', 0)}")
+            
+            if 'error_patterns' in detailed_result:
+                error_patterns = detailed_result['error_patterns']
+                if 'top_common_errors' in error_patterns and error_patterns['top_common_errors']:
+                    print("\n常见错误模式:")
+                    for i, err in enumerate(error_patterns['top_common_errors'][:5]):
+                        print(f"  {i+1}. '{err['ref']}' → '{err['hyp']}' (出现 {err['count']} 次)")
     else:
         print("没有成功加载任何音频文件，请检查文件路径和格式")
