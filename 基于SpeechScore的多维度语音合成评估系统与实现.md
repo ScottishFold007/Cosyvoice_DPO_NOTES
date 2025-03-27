@@ -12,9 +12,13 @@
 
 ### 韵律自然度评分：
 ```python
+import os
+import sys
 import numpy as np
 import librosa
+import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
+import argparse
 
 def improved_prosody_naturalness(audio, sr, language='chinese'):
     # 基频提取
@@ -26,7 +30,7 @@ def improved_prosody_naturalness(audio, sr, language='chinese'):
     # 1. 改进F0连续性评估 - 考虑语言特性
     f0_cleaned = f0[~np.isnan(f0)]
     if len(f0_cleaned) < 2:
-        return 0.0
+        return 0.0, {"f0_continuity": 0, "energy_naturalness": 0, "pause_score": 0, "speech_rate_naturalness": 0}
     
     # 计算F0 jitter - 短期变化
     f0_diff = np.diff(f0_cleaned)
@@ -84,7 +88,16 @@ def improved_prosody_naturalness(audio, sr, language='chinese'):
                                0.2 * pause_score +
                                0.2 * speech_rate_naturalness)
     
-    return prosody_naturalness
+    # 返回总分和各部分得分
+    scores = {
+        "f0_continuity": f0_continuity,
+        "energy_naturalness": energy_naturalness,
+        "pause_score": pause_score,
+        "speech_rate_naturalness": speech_rate_naturalness,
+        "syllable_rate": syllable_rate
+    }
+    
+    return prosody_naturalness, scores
 
 
 def estimate_syllable_rate(audio, sr, language='chinese'):
@@ -144,6 +157,108 @@ def evaluate_speech_rate(syllable_rate, language='chinese'):
     else:
         # 在最佳范围内给予满分
         return 1.0
+
+
+def visualize_prosody(audio, sr, scores, output_path=None):
+    """可视化韵律特征"""
+    plt.figure(figsize=(12, 10))
+    
+    # 1. 显示波形
+    plt.subplot(4, 1, 1)
+    plt.plot(np.arange(len(audio))/sr, audio)
+    plt.title("波形图")
+    plt.xlabel("时间 (秒)")
+    plt.ylabel("振幅")
+    
+    # 2. 显示能量包络
+    plt.subplot(4, 1, 2)
+    rms = librosa.feature.rms(y=audio)[0]
+    times = librosa.times_like(rms, sr=sr, hop_length=512)
+    plt.plot(times, rms)
+    plt.title(f"能量包络 (自然度: {scores['energy_naturalness']:.2f})")
+    plt.xlabel("时间 (秒)")
+    plt.ylabel("能量")
+    
+    # 3. 显示F0曲线
+    plt.subplot(4, 1, 3)
+    f0, voiced_flag, voiced_probs = librosa.pyin(audio, 
+                                               fmin=librosa.note_to_hz('C2'), 
+                                               fmax=librosa.note_to_hz('C7'),
+                                               sr=sr)
+    times = librosa.times_like(f0, sr=sr, hop_length=512)
+    plt.plot(times, f0)
+    plt.title(f"基频曲线 (连续性: {scores['f0_continuity']:.2f})")
+    plt.xlabel("时间 (秒)")
+    plt.ylabel("频率 (Hz)")
+    
+    # 4. 显示评分结果
+    plt.subplot(4, 1, 4)
+    categories = ['F0连续性', '能量自然度', '停顿评分', '语速自然度']
+    values = [scores['f0_continuity'], scores['energy_naturalness'], 
+              scores['pause_score'], scores['speech_rate_naturalness']]
+    
+    plt.bar(categories, values)
+    plt.ylim(0, 1)
+    plt.title(f"韵律评分组成 (总分: {total_score:.2f}/5)")
+    
+    plt.tight_layout()
+    
+    # 保存或显示
+    if output_path:
+        plt.savefig(output_path)
+        print(f"可视化结果已保存至: {output_path}")
+    else:
+        plt.show()
+
+
+def main():
+    # 命令行参数解析
+    parser = argparse.ArgumentParser(description='评估WAV文件的韵律自然度')
+    parser.add_argument('--wav_file', type=str, default= "/content/tts_samples/听书-苏轼.wav",help='WAV文件路径')
+    parser.add_argument('--language', '-l', type=str, default='chinese', 
+                      choices=['chinese', 'english'], help='音频语言 (默认: chinese)')
+    parser.add_argument('--visualize', '-v', action='store_true', 
+                      help='是否可视化韵律特征')
+    parser.add_argument('--output', '-o', type=str, default=None,
+                      help='可视化结果保存路径 (.png)')
+    
+    args = parser.parse_args([])
+    
+    # 检查文件是否存在
+    if not os.path.exists(args.wav_file):
+        print(f"错误: 文件 '{args.wav_file}' 不存在")
+        sys.exit(1)
+    
+    # 加载WAV文件
+    try:
+        print(f"正在加载音频文件: {args.wav_file}")
+        audio, sr = librosa.load(args.wav_file, sr=None)
+        duration = len(audio) / sr
+        print(f"音频长度: {duration:.2f}秒, 采样率: {sr}Hz")
+    except Exception as e:
+        print(f"加载音频失败: {str(e)}")
+        sys.exit(1)
+    
+    # 计算韵律自然度
+    print(f"正在分析韵律自然度 (语言: {args.language})...")
+    total_score, detailed_scores = improved_prosody_naturalness(audio, sr, args.language)
+    
+    # 输出结果
+    print("\n韵律自然度评估结果:")
+    print(f"总分: {total_score:.2f}/5.00")
+    print(f"F0连续性得分: {detailed_scores['f0_continuity']:.2f}")
+    print(f"能量自然度得分: {detailed_scores['energy_naturalness']:.2f}")
+    print(f"停顿节奏得分: {detailed_scores['pause_score']:.2f}")
+    print(f"语速自然度得分: {detailed_scores['speech_rate_naturalness']:.2f}")
+    print(f"估计音节速率: {detailed_scores['syllable_rate']:.2f} 音节/秒")
+    
+    # 可视化（如果需要）
+    if args.visualize:
+        print("\n生成韵律特征可视化...")
+        visualize_prosody(audio, sr, detailed_scores, args.output)
+
+if __name__ == "__main__":
+    main()
 ```
 
 ### 表达多样性指数：
