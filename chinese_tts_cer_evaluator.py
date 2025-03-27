@@ -3,8 +3,7 @@ import numpy as np
 import tempfile
 import soundfile as sf
 import json
-from modelscope.pipelines import pipeline
-from modelscope.utils.constant import Tasks
+from funasr import AutoModel  # 导入FunASR的AutoModel
 import pypinyin
 from pypinyin import lazy_pinyin, Style
 import re
@@ -13,21 +12,19 @@ import Levenshtein
 
 class FunASRCERCalculator:
     """基于FunASR的中文TTS字符错误率评估器，支持多音字处理"""
-    # 多音字字典地址：https://github.com/mapull/chinese-dictionary/blob/main/character/polyphone.json
-    def __init__(self, model_name="damo/speech_paraformer-large_asr_nat-zh-cn", 
-                 polyphone_path="polyphone.json"):
+    
+    def __init__(self, model_name="paraformer-zh", 
+                 polyphone_path="polyphone.json", 
+                 device="cuda:0"):
         """
         初始化CER计算器
         Args:
             model_name: FunASR模型名称
             polyphone_path: 多音字词典路径
+            device: 推理设备，默认GPU
         """
-        # 初始化FunASR的ASR管道
-        self.asr_pipeline = pipeline(
-            task=Tasks.auto_speech_recognition,
-            model=model_name,
-            model_revision='v1.0.0'
-        )
+        # 初始化FunASR的ASR模型
+        self.asr_model = AutoModel(model=model_name, device=device)
         
         # 临时文件存储目录
         self.temp_dir = tempfile.mkdtemp(prefix="cer_eval_")
@@ -69,609 +66,513 @@ class FunASRCERCalculator:
                         normalized_pinyins.append(normalized_p.lower())
                     
                     polyphone_dict[char] = {
-                        'original': pinyins,  # 带声调拼音
-                        'normalized': normalized_pinyins  # 无声调拼音
+                        'original': pinyins,
+                        'normalized': normalized_pinyins
                     }
             
-            print(f"成功加载多音字字典，共{len(polyphone_dict)}个多音字")
+            print(f"成功加载多音字字典，包含 {len(polyphone_dict)} 个条目")
             return polyphone_dict
         except Exception as e:
             print(f"加载多音字字典失败: {e}")
             return {}
     
-    def preprocess_text(self, text, remove_punctuation=True, convert_to_lower=True):
+    def compute_cer(self, audio, sr, text, consider_polyphones=True, detailed_analysis=False):
         """
-        文本预处理
-        
-        Args:
-            text: 输入文本
-            remove_punctuation: 是否移除标点符号
-            convert_to_lower: 是否转换为小写
-        
-        Returns:
-            处理后的文本
-        """
-        # 移除空白字符
-        text = re.sub(r'\s+', '', text)
-        
-        if remove_punctuation:
-            # 移除标点符号
-            punctuation = r'[^\w\s]'
-            text = re.sub(punctuation, '', text)
-            
-        if convert_to_lower:
-            # 转换为小写
-            text = text.lower()
-            
-        return text
-    
-    def compute_cer(self, audio, sr, reference_text, 
-                    consider_polyphones=True, 
-                    detailed_analysis=False):
-        """
-        计算音频与参考文本的字符错误率
+        计算字符错误率
         
         Args:
             audio: 音频数据（numpy数组）
             sr: 采样率
-            reference_text: 参考文本
+            text: 参考文本
             consider_polyphones: 是否考虑多音字
-            detailed_analysis: 是否返回详细错误分析
+            detailed_analysis: 是否进行详细错误分析
             
         Returns:
-            CER值和详细分析（如果requested）
+            CER 或 详细分析结果
         """
+        # 确保文本使用utf-8编码
+        if isinstance(text, bytes):
+            text = text.decode('utf-8')
+        
         # 保存音频到临时文件
-        temp_wav_path = os.path.join(self.temp_dir, "temp_audio.wav")
-        sf.write(temp_wav_path, audio, sr)
+        temp_file = os.path.join(self.temp_dir, f"temp_{np.random.randint(10000)}.wav")
+        sf.write(temp_file, audio, sr)
         
-        # 使用FunASR转写音频
-        asr_result = self.asr_pipeline(temp_wav_path)
-        transcribed_text = asr_result['text']
-        
-        # 预处理参考文本和转写文本
-        ref_text = self.preprocess_text(reference_text)
-        hyp_text = self.preprocess_text(transcribed_text)
-        
-        # 基础CER计算
-        distance = self._calculate_edit_distance(ref_text, hyp_text, consider_polyphones)
-        ref_length = len(ref_text)
-        cer = distance / ref_length if ref_length > 0 else 0.0
-        
-        if not detailed_analysis:
-            return cer
-        
-        # 详细分析
-        analysis_result = {
-            'cer': cer,
-            'ref_text': ref_text,
-            'hyp_text': hyp_text,
-            'audio_path': temp_wav_path,
-            'char_level': self._analyze_char_errors(ref_text, hyp_text, consider_polyphones),
-            'pinyin_level': self._analyze_pinyin_errors(ref_text, hyp_text, consider_polyphones),
-            'word_level': self._analyze_word_errors(reference_text, transcribed_text)
-        }
-        
-        # 添加错误模式分析
-        analysis_result['error_patterns'] = self._analyze_error_patterns(ref_text, hyp_text)
-        
-        return analysis_result
+        try:
+            # 使用FunASR模型进行识别
+            result = self.asr_model.generate(input=temp_file)
+            
+            # 提取识别结果文本（与FunASR输出格式匹配）
+            if isinstance(result, list) and len(result) > 0:
+                if isinstance(result[0], dict) and "text" in result[0]:
+                    transcription = result[0]["text"]
+                else:
+                    transcription = str(result[0])
+            else:
+                transcription = str(result)
+            
+            # 移除标点符号
+            ref_text_clean = re.sub(r'[^\w\s]|_', '', text)
+            hyp_text_clean = re.sub(r'[^\w\s]|_', '', transcription)
+            
+            # 移除多余空格
+            ref_text_clean = ' '.join(ref_text_clean.split())
+            hyp_text_clean = ' '.join(hyp_text_clean.split())
+            
+            # 计算CER
+            if consider_polyphones:
+                cer, operations = self._calculate_polyphone_aware_cer(ref_text_clean, hyp_text_clean)
+            else:
+                # 使用编辑距离计算普通CER
+                distance = Levenshtein.distance(ref_text_clean, hyp_text_clean)
+                cer = distance / len(ref_text_clean) if len(ref_text_clean) > 0 else 1.0
+                operations = None
+            
+            # 如果需要详细分析
+            if detailed_analysis:
+                analysis_result = self._analyze_errors(ref_text_clean, hyp_text_clean, operations)
+                
+                return {
+                    'cer': cer,
+                    'transcription': transcription,
+                    'reference': text,
+                    'ref_clean': ref_text_clean,
+                    'hyp_clean': hyp_text_clean,
+                    'error_patterns': analysis_result,
+                    'has_polyphones': self._contains_polyphones(ref_text_clean),
+                    'has_question': '?' in text or '？' in text,
+                    'text_length': len(ref_text_clean)
+                }
+            else:
+                return cer
+                
+        except Exception as e:
+            print(f"ASR或CER计算过程中出错: {e}")
+            if detailed_analysis:
+                return {
+                    'cer': 1.0,
+                    'transcription': '',
+                    'reference': text,
+                    'ref_clean': '',
+                    'hyp_clean': '',
+                    'error_patterns': {'error': str(e)},
+                    'has_polyphones': self._contains_polyphones(text),
+                    'has_question': '?' in text or '？' in text,
+                    'text_length': len(text)
+                }
+            else:
+                return 1.0
+        finally:
+            # 清理临时文件
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
     
-    def _calculate_edit_distance(self, ref_text, hyp_text, consider_polyphones=True):
+    def _calculate_polyphone_aware_cer(self, ref_text, hyp_text):
         """
-        计算编辑距离，可选择考虑多音字
+        考虑多音字的CER计算
         
         Args:
             ref_text: 参考文本
-            hyp_text: 转写文本
-            consider_polyphones: 是否考虑多音字
+            hyp_text: 假设文本
             
         Returns:
-            编辑距离
+            cer值和编辑操作列表
         """
-        if not consider_polyphones:
-            # 标准编辑距离计算
-            return Levenshtein.distance(ref_text, hyp_text)
+        # 获取参考文本和假设文本的拼音序列
+        ref_pinyin = lazy_pinyin(ref_text)
+        hyp_pinyin = lazy_pinyin(hyp_text)
         
-        # 考虑多音字情况下的编辑距离计算
-        # 可使用动态规划实现自定义编辑距离
+        # 保存编辑操作
+        operations = []
+        
+        # 初始化编辑距离矩阵
         m, n = len(ref_text), len(hyp_text)
         dp = [[0] * (n + 1) for _ in range(m + 1)]
         
-        # 初始化边界
+        # 初始化第一行和第一列
         for i in range(m + 1):
             dp[i][0] = i
         for j in range(n + 1):
             dp[0][j] = j
         
-        # 动态规划填表
+        # 填充编辑距离矩阵
         for i in range(1, m + 1):
             for j in range(1, n + 1):
-                # 计算替换代价，考虑多音字
-                substitution_cost = 1
-                if ref_text[i-1] == hyp_text[j-1]:
-                    substitution_cost = 0
-                elif self._is_valid_polyphone_variant(ref_text[i-1], hyp_text[j-1]):
-                    # 如果是有效的多音字变体，不计错误
-                    substitution_cost = 0
+                # 检查字符是否相同
+                ref_char = ref_text[i-1]
+                hyp_char = hyp_text[j-1]
                 
-                # 计算插入、删除和替换操作的代价
-                dp[i][j] = min(
-                    dp[i-1][j] + 1,          # 删除
-                    dp[i][j-1] + 1,          # 插入
-                    dp[i-1][j-1] + substitution_cost  # 替换
-                )
+                # 如果字符相同，不需要编辑
+                if ref_char == hyp_char:
+                    dp[i][j] = dp[i-1][j-1]
+                else:
+                    # 检查多音字情况：字不同但发音相同
+                    ref_char_pinyin = ref_pinyin[i-1] if i-1 < len(ref_pinyin) else ''
+                    hyp_char_pinyin = hyp_pinyin[j-1] if j-1 < len(hyp_pinyin) else ''
+                    
+                    # 如果拼音相同，且是正确的多音字变体
+                    if (ref_char_pinyin == hyp_char_pinyin and 
+                        ref_char_pinyin and 
+                        self._is_valid_polyphone_variant(ref_char, hyp_char)):
+                        # 这种情况下，不计算错误
+                        dp[i][j] = dp[i-1][j-1]
+                    else:
+                        # 否则，取增删改三种操作的最小代价
+                        dp[i][j] = min(
+                            dp[i-1][j] + 1,     # 删除
+                            dp[i][j-1] + 1,     # 插入
+                            dp[i-1][j-1] + 1    # 替换
+                        )
         
-        return dp[m][n]
+        # 反向回溯确定编辑操作
+        i, j = m, n
+        while i > 0 or j > 0:
+            if i > 0 and j > 0 and ref_text[i-1] == hyp_text[j-1]:
+                # 匹配
+                operations.append(('match', i-1, j-1))
+                i -= 1
+                j -= 1
+            elif i > 0 and j > 0 and dp[i][j] == dp[i-1][j-1] + 1:
+                # 替换
+                if i-1 < len(ref_pinyin) and j-1 < len(hyp_pinyin):
+                    if ref_pinyin[i-1] == hyp_pinyin[j-1]:
+                        operations.append(('polyphone', i-1, j-1))
+                    else:
+                        operations.append(('substitute', i-1, j-1))
+                else:
+                    operations.append(('substitute', i-1, j-1))
+                i -= 1
+                j -= 1
+            elif i > 0 and dp[i][j] == dp[i-1][j] + 1:
+                # 删除
+                operations.append(('delete', i-1, -1))
+                i -= 1
+            elif j > 0 and dp[i][j] == dp[i][j-1] + 1:
+                # 插入
+                operations.append(('insert', -1, j-1))
+                j -= 1
+            else:
+                # 多音字匹配情况
+                operations.append(('polyphone', i-1, j-1))
+                i -= 1
+                j -= 1
+        
+        # 计算CER
+        cer = dp[m][n] / m if m > 0 else 1.0
+        
+        return cer, operations
     
-    def _is_valid_polyphone_variant(self, char1, char2):
+    def _is_valid_polyphone_variant(self, ref_char, hyp_char):
         """
-        检查两个字符是否是相同的多音字的有效变体
-        本例直接检查两个字符是否相同，多音字问题通过拼音处理
+        检查两个字符是否互为合法的多音字变体
         
         Args:
-            char1: 第一个字符
-            char2: 第二个字符
+            ref_char: 参考字符
+            hyp_char: 假设字符
             
         Returns:
-            是否为有效变体
+            是否为合法多音字变体
         """
-        # 字符相同直接返回True
-        if char1 == char2:
-            return True
-            
-        # 目前仅检查完全相同的字符
-        # 更复杂的多音字变体处理可以在未来实现
-        return False
+        # 检查参考字符是否是多音字
+        if ref_char not in self.polyphone_dict:
+            return False
         
-    def _analyze_char_errors(self, ref_text, hyp_text, consider_polyphones=True):
+        # 获取假设字符的拼音
+        hyp_char_pinyin = lazy_pinyin(hyp_char)[0] if hyp_char else ''
+        
+        # 标准化拼音（移除声调）
+        normalized_hyp_pinyin = re.sub(r'[àáâãäåāǎ]', 'a', hyp_char_pinyin)
+        normalized_hyp_pinyin = re.sub(r'[èéêëēěẽ]', 'e', normalized_hyp_pinyin)
+        normalized_hyp_pinyin = re.sub(r'[ìíîïīǐĩ]', 'i', normalized_hyp_pinyin)
+        normalized_hyp_pinyin = re.sub(r'[òóôõöōǒ]', 'o', normalized_hyp_pinyin)
+        normalized_hyp_pinyin = re.sub(r'[ùúûüūǔũ]', 'u', normalized_hyp_pinyin)
+        normalized_hyp_pinyin = re.sub(r'[ǚǜǘǖü]', 'v', normalized_hyp_pinyin)
+        normalized_hyp_pinyin = normalized_hyp_pinyin.lower()
+        
+        # 检查假设字符的拼音是否在参考字符的多音字列表中
+        return normalized_hyp_pinyin in self.polyphone_dict[ref_char]['normalized']
+    
+    def _contains_polyphones(self, text):
         """
-        分析字符级别的错误
+        检查文本是否包含多音字
+        
+        Args:
+            text: 待检查的文本
+            
+        Returns:
+            bool: 是否包含多音字
+        """
+        for char in text:
+            if char in self.polyphone_dict:
+                return True
+        return False
+    
+    def _analyze_errors(self, ref_text, hyp_text, operations):
+        """
+        分析错误类型和模式
         
         Args:
             ref_text: 参考文本
-            hyp_text: 转写文本
-            consider_polyphones: 是否考虑多音字
+            hyp_text: 假设文本
+            operations: 编辑操作列表
             
         Returns:
-            字符错误分析
+            错误分析结果
         """
-        # 获取编辑操作
-        operations = Levenshtein.editops(ref_text, hyp_text)
-        
-        # 统计各类操作
-        substitutions = [op for op in operations if op[0] == 'replace']
-        insertions = [op for op in operations if op[0] == 'insert']
-        deletions = [op for op in operations if op[0] == 'delete']
-        
-        # 过滤掉多音字的有效变体
-        if consider_polyphones:
-            valid_polyphone_subs = []
-            for op in substitutions:
-                ref_char = ref_text[op[1]]
-                hyp_char = hyp_text[op[2]]
-                
-                # 获取字符的拼音
-                ref_pinyin = lazy_pinyin([ref_char], style=pypinyin.NORMAL)[0]
-                hyp_pinyin = lazy_pinyin([hyp_char], style=pypinyin.NORMAL)[0]
-                
-                # 检查是否是多音字
-                if ref_char in self.polyphone_dict:
-                    if hyp_pinyin in self.polyphone_dict[ref_char]['normalized']:
-                        valid_polyphone_subs.append(op)
-            
-            # 从substitutions中移除有效的多音字变体
-            for op in valid_polyphone_subs:
-                if op in substitutions:
-                    substitutions.remove(op)
-        
-        # 构建详细错误分析
-        char_errors = {
-            'substitutions': {
-                'count': len(substitutions),
-                'details': []
-            },
-            'insertions': {
-                'count': len(insertions),
-                'details': []
-            },
-            'deletions': {
-                'count': len(deletions),
-                'details': []
-            },
-            'total_operations': len(operations)
+        # 初始化各类错误计数
+        error_counts = {
+            'substitutions': 0,
+            'insertions': 0,
+            'deletions': 0,
+            'polyphone_errors': 0
         }
         
-        # 添加详细信息
-        for op in substitutions:
-            char_errors['substitutions']['details'].append({
-                'position': op[1],
-                'ref_char': ref_text[op[1]],
-                'hyp_char': hyp_text[op[2]]
-            })
-            
-        for op in insertions:
-            char_errors['insertions']['details'].append({
-                'position': op[1],
-                'hyp_char': hyp_text[op[2]]
-            })
-            
-        for op in deletions:
-            char_errors['deletions']['details'].append({
-                'position': op[1],
-                'ref_char': ref_text[op[1]]
-            })
-            
-        return char_errors
+        # 详细错误分析
+        char_level_errors = []
+        polyphone_errors = {'count': 0, 'details': []}
+        similar_sound_errors = {'count': 0, 'details': []}
+        
+        if operations:
+            for op, ref_idx, hyp_idx in operations:
+                if op == 'substitute':
+                    error_counts['substitutions'] += 1
+                    if ref_idx >= 0 and ref_idx < len(ref_text) and hyp_idx >= 0 and hyp_idx < len(hyp_text):
+                        ref_char = ref_text[ref_idx]
+                        hyp_char = hyp_text[hyp_idx]
+                        
+                        char_level_errors.append({
+                            'type': 'substitute',
+                            'position': ref_idx,
+                            'ref_char': ref_char,
+                            'hyp_char': hyp_char
+                        })
+                        
+                        # 检查是否是发音相似错误
+                        ref_char_pinyin = lazy_pinyin(ref_char)[0] if ref_char else ''
+                        hyp_char_pinyin = lazy_pinyin(hyp_char)[0] if hyp_char else ''
+                        
+                        # 标准化拼音用于比较
+                        ref_pinyin_norm = self._normalize_pinyin(ref_char_pinyin)
+                        hyp_pinyin_norm = self._normalize_pinyin(hyp_char_pinyin)
+                        
+                        # 如果声母相同或拼音相似度大于阈值
+                        if ref_pinyin_norm and hyp_pinyin_norm:
+                            if self._get_pinyin_initial(ref_pinyin_norm) == self._get_pinyin_initial(hyp_pinyin_norm):
+                                similar_sound_errors['count'] += 1
+                                similar_sound_errors['details'].append({
+                                    'position': ref_idx,
+                                    'ref_char': ref_char,
+                                    'hyp_char': hyp_char,
+                                    'ref_pinyin': ref_char_pinyin,
+                                    'hyp_pinyin': hyp_char_pinyin
+                                })
+                        
+                elif op == 'delete':
+                    error_counts['deletions'] += 1
+                    if ref_idx >= 0 and ref_idx < len(ref_text):
+                        char_level_errors.append({
+                            'type': 'delete',
+                            'position': ref_idx,
+                            'ref_char': ref_text[ref_idx],
+                            'hyp_char': ''
+                        })
+                elif op == 'insert':
+                    error_counts['insertions'] += 1
+                    if hyp_idx >= 0 and hyp_idx < len(hyp_text):
+                        char_level_errors.append({
+                            'type': 'insert',
+                            'position': ref_idx if ref_idx >= 0 else 0,
+                            'ref_char': '',
+                            'hyp_char': hyp_text[hyp_idx]
+                        })
+                elif op == 'polyphone':
+                    error_counts['polyphone_errors'] += 1
+                    if ref_idx >= 0 and ref_idx < len(ref_text) and hyp_idx >= 0 and hyp_idx < len(hyp_text):
+                        ref_char = ref_text[ref_idx]
+                        hyp_char = hyp_text[hyp_idx]
+                        
+                        # 获取多音字的所有拼音变体
+                        possible_pinyins = []
+                        if ref_char in self.polyphone_dict:
+                            possible_pinyins = self.polyphone_dict[ref_char]['original']
+                        
+                        polyphone_errors['details'].append({
+                            'position': ref_idx,
+                            'ref_char': ref_char,
+                            'hyp_char': hyp_char,
+                            'ref_pinyin': lazy_pinyin(ref_char, style=pypinyin.STYLE_TONE)[0] if ref_char else '',
+                            'hyp_pinyin': lazy_pinyin(hyp_char, style=pypinyin.STYLE_TONE)[0] if hyp_char else '',
+                            'possible_pinyins': possible_pinyins
+                        })
+        
+        polyphone_errors['count'] = error_counts['polyphone_errors']
+        
+        # 词级别错误分析
+        ref_words = list(jieba.cut(ref_text))
+        hyp_words = list(jieba.cut(hyp_text))
+        
+        word_level_match = Levenshtein.ratio(
+            ' '.join(ref_words), 
+            ' '.join(hyp_words)
+        )
+        
+        # 检测连续错误
+        consecutive_errors = self._find_consecutive_errors(char_level_errors)
+        
+        # 检测声调错误
+        tone_errors = self._find_tone_errors(ref_text, hyp_text)
+        
+        # 返回完整的错误分析结果
+        return {
+            'char_level': char_level_errors,
+            'error_counts': error_counts,
+            'word_level_match': word_level_match,
+            'polyphone_errors': polyphone_errors,
+            'similar_sound_errors': similar_sound_errors,
+            'consecutive_errors': consecutive_errors,
+            'tone_errors': tone_errors
+        }
     
-    def _analyze_pinyin_errors(self, ref_text, hyp_text, consider_polyphones=True):
-        """
-        分析拼音级别的错误，特别处理多音字情况
+    def _normalize_pinyin(self, pinyin):
+        """标准化拼音（移除声调等）"""
+        if not pinyin:
+            return ''
         
-        Args:
-            ref_text: 参考文本
-            hyp_text: 转写文本
-            consider_polyphones: 是否考虑多音字
+        # 去除音调
+        normalized = re.sub(r'[àáâãäåāǎ]', 'a', pinyin)
+        normalized = re.sub(r'[èéêëēěẽ]', 'e', normalized)
+        normalized = re.sub(r'[ìíîïīǐĩ]', 'i', normalized)
+        normalized = re.sub(r'[òóôõöōǒ]', 'o', normalized)
+        normalized = re.sub(r'[ùúûüūǔũ]', 'u', normalized)
+        normalized = re.sub(r'[ǚǜǘǖü]', 'v', normalized)
+        
+        return normalized.lower()
+    
+    def _get_pinyin_initial(self, pinyin):
+        """获取拼音的声母"""
+        initials = ['b', 'p', 'm', 'f', 'd', 't', 'n', 'l', 'g', 'k', 'h', 
+                   'j', 'q', 'x', 'zh', 'ch', 'sh', 'r', 'z', 'c', 's', 'y', 'w']
+        
+        for initial in sorted(initials, key=len, reverse=True):
+            if pinyin.startswith(initial):
+                return initial
+        
+        return pinyin[0] if pinyin else ''
+    
+    def _find_consecutive_errors(self, char_errors):
+        """查找连续错误"""
+        if not char_errors:
+            return []
+        
+        # 按位置排序错误
+        sorted_errors = sorted(char_errors, key=lambda x: x['position'])
+        
+        consecutive_errors = []
+        current_group = [sorted_errors[0]]
+        
+        for i in range(1, len(sorted_errors)):
+            current_error = sorted_errors[i]
+            prev_error = sorted_errors[i-1]
             
-        Returns:
-            拼音错误分析
-        """
-        # 提取拼音
-        ref_pinyin = lazy_pinyin(ref_text, style=pypinyin.NORMAL)
-        hyp_pinyin = lazy_pinyin(hyp_text, style=pypinyin.NORMAL)
+            # 如果位置相邻，添加到当前组
+            if current_error['position'] - prev_error['position'] == 1:
+                current_group.append(current_error)
+            else:
+                # 如果不相邻且当前组长度大于1，保存当前组
+                if len(current_group) > 1:
+                    consecutive_errors.append(current_group)
+                # 开始新组
+                current_group = [current_error]
         
-        # 带声调拼音用于分析声调错误
-        ref_pinyin_with_tone = lazy_pinyin(ref_text, style=pypinyin.TONE)
-        hyp_pinyin_with_tone = lazy_pinyin(hyp_text, style=pypinyin.TONE)
-        
-        # 考虑多音字的情况
-        if consider_polyphones:
-            # 对参考文本中的多音字，使用所有可能的拼音变体计算最小编辑距离
-            min_distance = float('inf')
-            best_ref_pinyin = ref_pinyin
+        # 添加最后一组（如果长度大于1）
+        if len(current_group) > 1:
+            consecutive_errors.append(current_group)
             
-            # 生成多音字所有可能的拼音组合
-            pinyin_variants = self._generate_pinyin_variants(ref_text)
-            
-            for variant in pinyin_variants:
-                distance = Levenshtein.distance(''.join(variant), ''.join(hyp_pinyin))
-                if distance < min_distance:
-                    min_distance = distance
-                    best_ref_pinyin = variant
-                    
-            ref_pinyin = best_ref_pinyin
+        return consecutive_errors
+    
+    def _find_tone_errors(self, ref_text, hyp_text):
+        """查找声调错误"""
+        # 提取带声调的拼音
+        ref_pinyin_with_tone = lazy_pinyin(ref_text, style=pypinyin.STYLE_TONE)
+        hyp_pinyin_with_tone = lazy_pinyin(hyp_text, style=pypinyin.STYLE_TONE)
         
-        # 计算拼音编辑距离
-        pinyin_distance = Levenshtein.distance(''.join(ref_pinyin), ''.join(hyp_pinyin))
-        ref_pinyin_length = len(''.join(ref_pinyin))
-        pinyin_error_rate = pinyin_distance / ref_pinyin_length if ref_pinyin_length > 0 else 0.0
+        # 提取不带声调的拼音
+        ref_pinyin = lazy_pinyin(ref_text)
+        hyp_pinyin = lazy_pinyin(hyp_text)
         
-        # 分析声调错误
         tone_errors = []
-        min_len = min(len(ref_text), len(hyp_text))
+        min_len = min(len(ref_pinyin), len(hyp_pinyin))
         
         for i in range(min_len):
-            # 基本拼音相同但声调不同
-            if i < len(ref_pinyin) and i < len(hyp_pinyin) and \
-               ref_pinyin[i] == hyp_pinyin[i] and \
-               i < len(ref_pinyin_with_tone) and i < len(hyp_pinyin_with_tone) and \
-               ref_pinyin_with_tone[i] != hyp_pinyin_with_tone[i]:
+            # 检查拼音相同但声调不同的情况
+            if ref_pinyin[i] == hyp_pinyin[i] and ref_pinyin_with_tone[i] != hyp_pinyin_with_tone[i]:
                 tone_errors.append({
                     "position": i,
-                    "ref_char": ref_text[i],
-                    "hyp_char": hyp_text[i],
+                    "ref_char": ref_text[i] if i < len(ref_text) else "",
+                    "hyp_char": hyp_text[i] if i < len(hyp_text) else "",
                     "ref_pinyin": ref_pinyin_with_tone[i],
                     "hyp_pinyin": hyp_pinyin_with_tone[i]
                 })
-        
-        return {
-            'pinyin_error_rate': pinyin_error_rate,
-            'tone_errors': {
-                'count': len(tone_errors),
-                'details': tone_errors
-            }
-        }
-    
-    def _generate_pinyin_variants(self, text):
-        """
-        生成多音字的所有可能拼音组合
-        
-        Args:
-            text: 输入文本
-            
-        Returns:
-            拼音变体列表
-        """
-        # 生成单字拼音变体列表
-        char_pinyin_variants = []
-        for char in text:
-            if char in self.polyphone_dict:
-                # 使用多音字字典中的所有拼音变体
-                char_pinyin_variants.append(self.polyphone_dict[char]['normalized'])
-            else:
-                # 非多音字使用标准拼音
-                pinyin = lazy_pinyin([char], style=pypinyin.NORMAL)
-                char_pinyin_variants.append(pinyin)
-        
-        # 限制变体数量，避免组合爆炸
-        max_variants = 100
-        total_combinations = 1
-        for variants in char_pinyin_variants:
-            total_combinations *= len(variants)
-        
-        if total_combinations <= max_variants:
-            # 递归生成所有拼音组合
-            return self._generate_combinations(char_pinyin_variants)
-        else:
-            # 超过限制，只使用默认拼音
-            return [lazy_pinyin(text, style=pypinyin.NORMAL)]
-    
-    def _generate_combinations(self, variants_list, index=0, current=None):
-        """
-        递归生成拼音组合
-        
-        Args:
-            variants_list: 每个位置的拼音变体列表
-            index: 当前处理的索引
-            current: 当前构建的组合
-            
-        Returns:
-            所有可能的拼音组合
-        """
-        if current is None:
-            current = []
-            
-        if index == len(variants_list):
-            return [current.copy()]
-            
-        results = []
-        for variant in variants_list[index]:
-            current.append(variant)
-            results.extend(self._generate_combinations(variants_list, index + 1, current))
-            current.pop()
-            
-        return results
-    
-    def _analyze_word_errors(self, reference_text, transcribed_text):
-        """
-        分析词级别的错误
-        
-        Args:
-            reference_text: 参考文本（原始未处理）
-            transcribed_text: 转写文本（原始未处理）
-            
-        Returns:
-            词错误分析
-        """
-        # 使用jieba分词
-        ref_words = list(jieba.cut(reference_text))
-        hyp_words = list(jieba.cut(transcribed_text))
-        
-        # 计算词错误率
-        word_distance = Levenshtein.distance(ref_words, hyp_words)
-        wer = word_distance / len(ref_words) if len(ref_words) > 0 else 0.0
-        
-        # 找出错误的词
-        operations = Levenshtein.editops(ref_words, hyp_words)
-        
-        substitutions = []
-        insertions = []
-        deletions = []
-        
-        for op in operations:
-            if op[0] == 'replace':
-                substitutions.append({
-                    'position': op[1],
-                    'ref_word': ref_words[op[1]],
-                    'hyp_word': hyp_words[op[2]]
-                })
-            elif op[0] == 'insert':
-                insertions.append({
-                    'position': op[1],
-                    'hyp_word': hyp_words[op[2]]
-                })
-            elif op[0] == 'delete':
-                deletions.append({
-                    'position': op[1],
-                    'ref_word': ref_words[op[1]]
-                })
-        
-        return {
-            'wer': wer,
-            'ref_words': ref_words,
-            'hyp_words': hyp_words,
-            'substitutions': {
-                'count': len(substitutions),
-                'details': substitutions
-            },
-            'insertions': {
-                'count': len(insertions),
-                'details': insertions
-            },
-            'deletions': {
-                'count': len(deletions),
-                'details': deletions
-            }
-        }
-    
-    def _analyze_error_patterns(self, ref_text, hyp_text):
-        """
-        分析错误模式
-        
-        Args:
-            ref_text: 参考文本
-            hyp_text: 转写文本
-            
-        Returns:
-            错误模式分析
-        """
-        # 获取编辑操作
-        operations = Levenshtein.editops(ref_text, hyp_text)
-        
-        # 分析相似发音错误
-        similar_sound_errors = []
-        for op in operations:
-            if op[0] == 'replace':
-                ref_char = ref_text[op[1]]
-                hyp_char = hyp_text[op[2]]
                 
-                # 获取拼音
-                ref_pinyin = lazy_pinyin([ref_char], style=pypinyin.NORMAL)[0] if ref_char else ""
-                hyp_pinyin = lazy_pinyin([hyp_char], style=pypinyin.NORMAL)[0] if hyp_char else ""
-                
-                # 判断拼音是否相似
-                if self._is_similar_pinyin(ref_pinyin, hyp_pinyin):
-                    similar_sound_errors.append({
-                        'position': op[1],
-                        'ref_char': ref_char,
-                        'hyp_char': hyp_char,
-                        'ref_pinyin': ref_pinyin,
-                        'hyp_pinyin': hyp_pinyin
-                    })
-        
-        # 分析多音字错误
-        polyphone_errors = []
-        for op in operations:
-            if op[0] == 'replace':
-                ref_char = ref_text[op[1]]
-                hyp_char = hyp_text[op[2]]
-                
-                if ref_char in self.polyphone_dict:
-                    ref_pinyin = lazy_pinyin([ref_char], style=pypinyin.NORMAL)[0]
-                    hyp_pinyin = lazy_pinyin([hyp_char], style=pypinyin.NORMAL)[0]
-                    
-                    polyphone_errors.append({
-                        'position': op[1],
-                        'ref_char': ref_char,
-                        'hyp_char': hyp_char,
-                        'ref_pinyin': ref_pinyin,
-                        'hyp_pinyin': hyp_pinyin,
-                        'possible_pinyins': self.polyphone_dict[ref_char]['original']
-                    })
-        
-        # 分析连续错误
-        consecutive_errors = self._find_consecutive_errors(ref_text, hyp_text)
-        
-        return {
-            'similar_sound_errors': {
-                'count': len(similar_sound_errors),
-                'details': similar_sound_errors
-            },
-            'polyphone_errors': {
-                'count': len(polyphone_errors),
-                'details': polyphone_errors
-            },
-            'consecutive_errors': {
-                'count': len(consecutive_errors),
-                'details': consecutive_errors
-            }
-        }
+        return tone_errors
     
-    def _is_similar_pinyin(self, pinyin1, pinyin2):
+    def compute_batch_cer(self, audios, sample_rates, texts, consider_polyphones=True):
         """
-        判断两个拼音是否相似
-        
-        Args:
-            pinyin1: 第一个拼音
-            pinyin2: 第二个拼音
-            
-        Returns:
-            是否相似
-        """
-        if not pinyin1 or not pinyin2:
-            return False
-            
-        # 计算拼音编辑距离
-        distance = Levenshtein.distance(pinyin1, pinyin2)
-        
-        # 相似度阈值，可以根据需要调整
-        threshold = 2
-        
-        return distance <= threshold
-    
-    def _find_consecutive_errors(self, ref_text, hyp_text):
-        """
-        查找连续错误
-        
-        Args:
-            ref_text: 参考文本
-            hyp_text: 转写文本
-            
-        Returns:
-            连续错误列表
-        """
-        ops = Levenshtein.editops(ref_text, hyp_text)
-        
-        # 按位置排序并查找连续错误
-        consecutive_groups = []
-        current_group = []
-        
-        for op in sorted(ops, key=lambda x: x[1]):
-            if not current_group or op[1] == current_group[-1][1] + 1:
-                current_group.append(op)
-            else:
-                if len(current_group) > 1:
-                    consecutive_groups.append(current_group)
-                current_group = [op]
-                
-        if len(current_group) > 1:
-            consecutive_groups.append(current_group)
-            
-        # 提取连续错误信息
-        consecutive_errors = []
-        for group in consecutive_groups:
-            start_pos = group[0][1]
-            end_pos = group[-1][1]
-            ref_segment = ref_text[start_pos:end_pos+1]
-            
-            # 提取假设文本对应段落
-            hyp_segment = ""
-            for op in group:
-                if op[0] != 'delete':  # 不是删除操作
-                    hyp_idx = op[2]
-                    if hyp_idx < len(hyp_text):
-                        hyp_segment += hyp_text[hyp_idx]
-            
-            consecutive_errors.append({
-                "start_pos": start_pos,
-                "end_pos": end_pos,
-                "ref_segment": ref_segment,
-                "hyp_segment": hyp_segment,
-                "error_length": len(group)
-            })
-            
-        return consecutive_errors
-        
-    def analyze_batch_by_text_features(self, audios, sample_rates, texts):
-        """
-        按文本特征分析CER表现
+        批量计算CER
         
         Args:
             audios: 音频数据列表
             sample_rates: 采样率列表
             texts: 文本列表
+            consider_polyphones: 是否考虑多音字
+            
+        Returns:
+            CER值列表
+        """
+        results = []
+        for audio, sr, text in zip(audios, sample_rates, texts):
+            cer = self.compute_cer(audio, sr, text, consider_polyphones=consider_polyphones)
+            results.append(cer)
+        
+        return results
+    
+    def analyze_batch_results(self, audios, sample_rates, texts, consider_polyphones=True):
+        """
+        批量计算CER并返回详细分析
+        
+        Args:
+            audios: 音频数据列表
+            sample_rates: 采样率列表
+            texts: 文本列表
+            consider_polyphones: 是否考虑多音字
+            
+        Returns:
+            详细分析结果列表
+        """
+        results = []
+        for audio, sr, text in zip(audios, sample_rates, texts):
+            result = self.compute_cer(audio, sr, text, 
+                                     consider_polyphones=consider_polyphones,
+                                     detailed_analysis=True)
+            results.append(result)
+        
+        return results
+    
+    def analyze_batch_by_text_features(self, audios, sample_rates, texts, consider_polyphones=True):
+        """
+        按文本特征分析CER
+        
+        Args:
+            audios: 音频数据列表
+            sample_rates: 采样率列表
+            texts: 文本列表
+            consider_polyphones: 是否考虑多音字
             
         Returns:
             按文本特征分组的CER分析
         """
-        results = []
-        
-        for i, (audio, sr, text) in enumerate(zip(audios, sample_rates, texts)):
-            cer = self.compute_cer(audio, sr, text)
-            
-            # 分析文本特征
-            text_length = len(text)
-            has_question = '?' in text
-            has_polyphones = any(char in self.polyphone_dict for char in text)
-            
-            results.append({
-                'text_id': i,
-                'text': text,
-                'cer': cer,
-                'text_length': text_length,
-                'has_question': has_question,
-                'has_polyphones': has_polyphones
-            })
+        # 获取详细结果
+        results = self.analyze_batch_results(audios, sample_rates, texts, consider_polyphones)
         
         # 按文本长度分组
         length_groups = {
@@ -732,27 +633,33 @@ class FunASRCERCalculator:
         return analysis
 
 
+# 创建模拟音频数据用于测试
+def create_dummy_audio(duration, sr):
+    """创建模拟音频数据"""
+    return np.random.randn(int(duration * sr)), sr
+
+
 if __name__ == "__main__":
     import soundfile as sf
     import os
     
     # 设置音频文件路径
-    #audio_dir = "tts_samples/"  # 存放TTS生成音频的目录
+    audio_dir = "tts_samples/"  # 存放TTS生成音频的目录
     
     # 准备测试文本和对应音频文件
     test_cases = [
         {
             "text": "今天天气真好，我很开心。",
-            "audio_path": "听书-苏轼.wav"
+            "audio_path": os.path.join(audio_dir, "sample1.wav")
         },
-        #{
-        #    "text": "长城是中国最著名的古迹，它的长度很长。",
-        #    "audio_path": os.path.join(audio_dir, "sample2.wav")
-        #},
-        #{
-        #    "text": "我买了一件衣服，花了几百元钱。",  # 包含多音字"几"和"长"
-        #    "audio_path": os.path.join(audio_dir, "sample3.wav")
-        #}
+        {
+            "text": "长城是中国最著名的古迹，它的长度很长。",
+            "audio_path": os.path.join(audio_dir, "sample2.wav")
+        },
+        {
+            "text": "我买了一件衣服，花了几百元钱。",  # 包含多音字"几"
+            "audio_path": os.path.join(audio_dir, "sample3.wav")
+        }
     ]
     
     # 准备音频列表和文本列表
@@ -779,7 +686,7 @@ if __name__ == "__main__":
             print(f"加载音频 {case['audio_path']} 失败: {e}")
     
     # 初始化多音字感知CER评估器
-    cer_calculator = FunASRCERCalculator(polyphone_path="polyphone.json")
+    cer_calculator = FunASRCERCalculator(model_name="paraformer-zh", polyphone_path="polyphone.json")
     
     # 单个音频评估示例
     if audios:
