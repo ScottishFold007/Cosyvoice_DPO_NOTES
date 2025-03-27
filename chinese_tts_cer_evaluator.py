@@ -1042,3 +1042,68 @@ if __name__ == "__main__":
                         print(f"  {i+1}. '{err['ref']}' → '{err['hyp']}' (出现 {err['count']} 次)")
     else:
         print("没有成功加载任何音频文件，请检查文件路径和格式")
+
+
+# 在输出详细错误分析部分后添加以下代码
+
+# 1. 声调错误分析
+if 'error_patterns' in detailed_result:
+    error_patterns = detailed_result['error_patterns']
+    
+    # 声调错误分析
+    if 'tone_errors' in error_patterns and error_patterns['tone_errors']:
+        print("\n=== 声调错误分析 ===")
+        print(f"发现 {len(error_patterns['tone_errors'])} 个声调错误")
+        for i, err in enumerate(error_patterns['tone_errors'][:5]):  # 只显示前5个
+            print(f"  {i+1}. 位置 {err['position']}: '{err['ref_char']}({err['ref_pinyin']})' → '{err['hyp_char']}({err['hyp_pinyin']})'")
+
+# 2. 连续错误检测
+if 'char_level' in detailed_result:
+    char_level = detailed_result['char_level']
+    
+    # 连续错误检测
+    if 'consecutive_errors' in char_level and char_level['consecutive_errors']:
+        print("\n=== 连续错误检测 ===")
+        print(f"发现 {len(char_level['consecutive_errors'])} 组连续错误")
+        for i, group in enumerate(char_level['consecutive_errors'][:3]):  # 只显示前3组
+            print(f"  连续错误组 {i+1} (长度: {len(group)}):")
+            errors_text = []
+            for err in group:
+                if err['type'] == 'substitute':
+                    errors_text.append(f"'{err['ref_char']}→{err['hyp_char']}'")
+                elif err['type'] == 'delete':
+                    errors_text.append(f"'{err['ref_char']}→∅'")
+                elif err['type'] == 'insert':
+                    errors_text.append(f"'∅→{err['hyp_char']}'")
+            print(f"    错误序列: {' '.join(errors_text)}")
+
+# 3. 发音相似错误分析
+if 'error_patterns' in detailed_result:
+    error_patterns = detailed_result['error_patterns']
+    
+    # 发音相似错误分析
+    if 'similar_sound_errors' in error_patterns and error_patterns['similar_sound_errors'].get('count', 0) > 0:
+        similar_errors = error_patterns['similar_sound_errors']
+        print("\n=== 发音相似错误分析 ===")
+        print(f"发现 {similar_errors['count']} 个发音相似错误")
+        for i, err in enumerate(similar_errors.get('details', [])[:5]):  # 只显示前5个
+            print(f"  {i+1}. '{err['ref_char']}({err['ref_pinyin']})' → '{err['hyp_char']}({err['hyp_pinyin']})'")
+
+# 4. 添加更多分析功能的统计概览
+print("\n=== 错误类型统计 ===")
+if 'error_patterns' in detailed_result:
+    error_rates = detailed_result['error_patterns'].get('error_rates', {})
+    print(f"替换错误率: {error_rates.get('substitution_rate', 0):.2%}")
+    print(f"删除错误率: {error_rates.get('deletion_rate', 0):.2%}")
+    print(f"插入错误率: {error_rates.get('insertion_rate', 0):.2%}")
+    
+    # 计算各种特殊错误所占比例
+    total_errors = sum(detailed_result['char_level'].get('error_counts', {}).values())
+    if total_errors > 0:
+        polyphone_count = detailed_result['char_level'].get('polyphone_errors', {}).get('count', 0)
+        similar_count = detailed_result['error_patterns'].get('similar_sound_errors', {}).get('count', 0)
+        tone_count = len(detailed_result['error_patterns'].get('tone_errors', []))
+        
+        print(f"多音字错误占比: {polyphone_count/total_errors:.2%}")
+        print(f"发音相似错误占比: {similar_count/total_errors:.2%}")
+        print(f"声调错误占比: {tone_count/total_errors:.2%}")
