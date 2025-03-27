@@ -12,42 +12,138 @@
 
 ### 韵律自然度评分：
 ```python
-def calculate_prosody_naturalness(audio, sr):
-    # 提取F0（基频）轨迹
+import numpy as np
+import librosa
+from scipy.signal import find_peaks
+
+def improved_prosody_naturalness(audio, sr, language='chinese'):
+    # 基频提取
     f0, voiced_flag, voiced_probs = librosa.pyin(audio, 
-                                                fmin=librosa.note_to_hz('C2'), 
-                                                fmax=librosa.note_to_hz('C7'),
-                                                sr=sr)
+                                               fmin=librosa.note_to_hz('C2'), 
+                                               fmax=librosa.note_to_hz('C7'),
+                                               sr=sr)
     
-    # 1. 计算F0连续性 - 自然语音的F0轨迹应当平滑过渡
+    # 1. 改进F0连续性评估 - 考虑语言特性
     f0_cleaned = f0[~np.isnan(f0)]
     if len(f0_cleaned) < 2:
         return 0.0
     
+    # 计算F0 jitter - 短期变化
     f0_diff = np.diff(f0_cleaned)
-    f0_continuity = 1.0 - min(1.0, np.mean(np.abs(f0_diff)) / 50.0)
+    jitter = np.mean(np.abs(f0_diff)) / np.mean(f0_cleaned)
+    # 自适应阈值，考虑语言特性
+    jitter_threshold = 0.05 if language == 'chinese' else 0.08
+    f0_continuity = 1.0 - min(1.0, jitter / jitter_threshold)
     
-    # 2. 计算能量变化自然度
+    # 2. 改进能量变化自然度评估
+    # 计算音频能量包络
     rms = librosa.feature.rms(y=audio)[0]
-    rms_diff = np.diff(rms)
-    energy_naturalness = 1.0 - min(1.0, np.std(rms_diff) / np.mean(rms) / 0.5)
     
-    # 3. 分析停顿分布
-    silence_threshold = 0.02
+    # 语言特定的能量变化参数
+    energy_smoothness_factor = 0.4 if language == 'chinese' else 0.6
+    
+    # 计算能量变化率
+    rms_diff = np.diff(rms)
+    # 归一化能量变化
+    normalized_rms_diff = np.abs(rms_diff) / (np.mean(rms) + 1e-8)
+    
+    # 评估能量变化的自然度
+    energy_naturalness = 1.0 - min(1.0, np.std(normalized_rms_diff) / energy_smoothness_factor)
+    
+    # 3. 改进停顿分析 - 自适应阈值
+    # 动态计算静音阈值，使用音频的一定百分比能量作为基准
+    silence_threshold = np.percentile(rms, 15)  # 使用底部15%能量作为静音阈值
     is_silence = rms < silence_threshold
+    
+    # 找出静音/发声的转换点
     silence_positions = np.where(np.diff(is_silence.astype(int)) != 0)[0]
     
-    # 自然语音通常停顿应该遵循某种模式，不会过于频繁或稀疏
+    # 评估停顿模式
     if len(silence_positions) < 2:
         pause_score = 0.5  # 几乎没有停顿变化
     else:
         pause_intervals = np.diff(silence_positions)
-        pause_regularity = 1.0 - min(1.0, np.std(pause_intervals) / np.mean(pause_intervals))
+        
+        # 计算停顿间隔的变异系数，而不是标准差
+        cv_pause = np.std(pause_intervals) / (np.mean(pause_intervals) + 1e-8)
+        
+        # 适度的变异是自然的，因此我们使用二次函数：
+        # - 很小的变异（机械）或很大的变异（不规则）都得低分
+        # - 中等程度的变异（自然）得高分
+        optimal_cv = 0.6  # 最佳变异系数
+        pause_regularity = 1.0 - min(1.0, 2.0 * abs(cv_pause - optimal_cv))
         pause_score = pause_regularity
     
-    # 综合得分(0-5分制)
-    prosody_naturalness = 5.0 * (0.4 * f0_continuity + 0.4 * energy_naturalness + 0.2 * pause_score)
+    # 4. 增加语速评估
+    syllable_rate = estimate_syllable_rate(audio, sr, language)
+    speech_rate_naturalness = evaluate_speech_rate(syllable_rate, language)
+    
+    # 综合得分(0-5分制)，调整权重加入语速因素
+    prosody_naturalness = 5.0 * (0.3 * f0_continuity + 
+                               0.3 * energy_naturalness + 
+                               0.2 * pause_score +
+                               0.2 * speech_rate_naturalness)
+    
     return prosody_naturalness
+
+
+def estimate_syllable_rate(audio, sr, language='chinese'):
+    """估计音频中的音节速率（每秒音节数）"""
+    # 提取音频包络
+    rms = librosa.feature.rms(y=audio)[0]
+    
+    # 使用能量包络的峰值估计音节数
+    # 调整最小峰值高度和距离，考虑语言特性
+    if language == 'chinese':
+        # 中文音节通常更短，峰值间距离更小
+        min_peak_distance = int(sr * 0.1 / 512)  # 大约100ms
+        prominence = np.mean(rms) * 0.5
+    else:
+        # 其他语言（如英语）音节间距可能更大
+        min_peak_distance = int(sr * 0.15 / 512)  # 大约150ms
+        prominence = np.mean(rms) * 0.6
+    
+    # 查找能量包络中的峰值
+    peaks, _ = find_peaks(rms, distance=min_peak_distance, prominence=prominence)
+    
+    # 估计音节数量
+    num_syllables = len(peaks)
+    
+    # 计算音频时长（秒）
+    duration = len(audio) / sr
+    
+    # 计算每秒音节数
+    syllable_rate = num_syllables / duration if duration > 0 else 0
+    
+    return syllable_rate
+
+
+def evaluate_speech_rate(syllable_rate, language='chinese'):
+    """评估语速的自然度（0-1分）"""
+    # 为不同语言设置最佳语速范围
+    if language == 'chinese':
+        # 中文的自然语速范围约为4-7音节/秒
+        optimal_min = 4.0
+        optimal_max = 7.0
+    else:
+        # 英语的自然语速范围约为3-6音节/秒
+        optimal_min = 3.0
+        optimal_max = 6.0
+    
+    # 语速过慢
+    if syllable_rate < optimal_min:
+        # 从0（极慢）到1（最佳最小值）的线性映射
+        return max(0, syllable_rate / optimal_min)
+    
+    # 语速过快
+    elif syllable_rate > optimal_max:
+        # 从1（最佳最大值）到0（极快，设定为最佳值的两倍）的线性映射
+        return max(0, 1.0 - (syllable_rate - optimal_max) / optimal_max)
+    
+    # 语速在最佳范围内
+    else:
+        # 在最佳范围内给予满分
+        return 1.0
 ```
 
 ### 表达多样性指数：
