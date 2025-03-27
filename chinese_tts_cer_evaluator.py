@@ -732,39 +732,108 @@ class FunASRCERCalculator:
         return analysis
 
 
-if __name__ == "__main__": 
+if __name__ == "__main__":
+    import soundfile as sf
+    import os
+    
+    # 设置音频文件路径
+    #audio_dir = "tts_samples/"  # 存放TTS生成音频的目录
+    
+    # 准备测试文本和对应音频文件
+    test_cases = [
+        {
+            "text": "今天天气真好，我很开心。",
+            "audio_path": "听书-苏轼.wav"
+        },
+        #{
+        #    "text": "长城是中国最著名的古迹，它的长度很长。",
+        #    "audio_path": os.path.join(audio_dir, "sample2.wav")
+        #},
+        #{
+        #    "text": "我买了一件衣服，花了几百元钱。",  # 包含多音字"几"和"长"
+        #    "audio_path": os.path.join(audio_dir, "sample3.wav")
+        #}
+    ]
+    
+    # 准备音频列表和文本列表
+    audios = []
+    sample_rates = []
+    texts = []
+    
+    # 加载所有音频文件
+    for case in test_cases:
+        try:
+            # 使用soundfile加载音频
+            audio_data, sample_rate = sf.read(case["audio_path"])
+            
+            # 如果是立体声，转为单声道
+            if len(audio_data.shape) > 1 and audio_data.shape[1] > 1:
+                audio_data = audio_data.mean(axis=1)
+                
+            audios.append(audio_data)
+            sample_rates.append(sample_rate)
+            texts.append(case["text"])
+            
+            print(f"成功加载音频: {case['audio_path']}, 采样率: {sample_rate}Hz, 时长: {len(audio_data)/sample_rate:.2f}秒")
+        except Exception as e:
+            print(f"加载音频 {case['audio_path']} 失败: {e}")
+    
     # 初始化多音字感知CER评估器
     cer_calculator = FunASRCERCalculator(polyphone_path="polyphone.json")
-
-    # 基本CER评估
-    cer = cer_calculator.compute_cer(audio, 24000, "今天天气真好，我很开心。")
-    print(f"基本CER: {cer:.4f}")
     
-    # 详细分析
-    detailed_result = cer_calculator.compute_cer(
-        audio, 24000, "长城是中国最著名的古迹，它的长度很长。", 
-        consider_polyphones=True,
-        detailed_analysis=True
-    )
-    
-    # 输出多音字分析
-    print("\n多音字错误分析:")
-    for error in detailed_result['error_patterns']['polyphone_errors']['details']:
-        print(f"位置 {error['position']}: 参考字符 '{error['ref_char']}' " 
-              f"(拼音: {error['ref_pinyin']}) -> "
-              f"识别字符 '{error['hyp_char']}' (拼音: {error['hyp_pinyin']})")
-        print(f"  可能的拼音变体: {', '.join(error['possible_pinyins'])}")
-    
-    # 批量特征分析
-    feature_analysis = cer_calculator.analyze_batch_by_text_features(
-        audios, sample_rates, texts
-    )
-    
-    print("\n文本特征CER分析:")
-    print(f"整体CER: {feature_analysis['overall']:.4f}")
-    print("按文本长度:")
-    for group, cer in feature_analysis['by_length'].items():
-        print(f"  {group}: {cer:.4f}")
-    print("按是否包含多音字:")
-    for group, cer in feature_analysis['by_polyphones'].items():
-        print(f"  {group}: {cer:.4f}")
+    # 单个音频评估示例
+    if audios:
+        # 基本CER评估（第一个音频）
+        print("\n=== 单个音频CER评估 ===")
+        cer = cer_calculator.compute_cer(audios[0], sample_rates[0], texts[0])
+        print(f"基本CER: {cer:.4f}")
+        
+        # 详细分析（第二个音频，如果存在）
+        if len(audios) > 1:
+            print("\n=== 详细CER分析（带多音字处理）===")
+            detailed_result = cer_calculator.compute_cer(
+                audios[1], sample_rates[1], texts[1], 
+                consider_polyphones=True,
+                detailed_analysis=True
+            )
+            
+            # 输出转写结果
+            print(f"原始文本: {texts[1]}")
+            print(f"ASR转写: {detailed_result.get('transcription', '未获取到转写结果')}")
+            print(f"CER: {detailed_result.get('cer', 0):.4f}")
+            
+            # 输出多音字分析
+            print("\n多音字错误分析:")
+            if 'error_patterns' in detailed_result and 'polyphone_errors' in detailed_result['error_patterns']:
+                polyphone_errors = detailed_result['error_patterns']['polyphone_errors']
+                if 'details' in polyphone_errors and polyphone_errors['details']:
+                    for error in polyphone_errors['details']:
+                        print(f"位置 {error['position']}: 参考字符 '{error['ref_char']}' " 
+                              f"(拼音: {error['ref_pinyin']}) -> "
+                              f"识别字符 '{error['hyp_char']}' (拼音: {error['hyp_pinyin']})")
+                        print(f"  可能的拼音变体: {', '.join(error.get('possible_pinyins', []))}")
+                else:
+                    print("  未检测到多音字错误")
+            else:
+                print("  未包含多音字错误分析")
+        
+        # 批量特征分析
+        if len(audios) > 2:
+            print("\n=== 批量特征分析 ===")
+            feature_analysis = cer_calculator.analyze_batch_by_text_features(
+                audios, sample_rates, texts
+            )
+            
+            print("\n文本特征CER分析:")
+            print(f"整体CER: {feature_analysis['overall']:.4f}")
+            print("按文本长度:")
+            for group, cer in feature_analysis['by_length'].items():
+                print(f"  {group}: {cer:.4f}")
+            print("按是否包含多音字:")
+            for group, cer in feature_analysis['by_polyphones'].items():
+                print(f"  {group}: {cer:.4f}")
+            print("按是否包含问句:")
+            for group, cer in feature_analysis['by_question'].items():
+                print(f"  {group}: {cer:.4f}")
+    else:
+        print("没有成功加载任何音频文件，请检查文件路径和格式")
