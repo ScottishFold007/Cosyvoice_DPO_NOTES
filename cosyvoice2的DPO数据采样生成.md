@@ -7,22 +7,28 @@
 import torch
 import torchaudio
 import numpy as np
-from typing import List, Dict, Tuple
+import pandas as pd
+from typing import List, Dict, Tuple, Optional, Generator
 import os
 from cosyvoice.cli.cosyvoice import CosyVoice2
 from cosyvoice.utils.file_utils import logging
 import yaml
 import copy
+import argparse
+from tqdm import tqdm
+import json
 
 def generate_diverse_samples(
     model_path: str,
     text: str,
     reference_audio_path: str,
     output_dir: str,
+    text_id: str,
     num_samples: int = 5,
-    sampling_params_list: List[Dict] = None,
+    sampling_params_list: Optional[List[Dict]] = None,
     stream: bool = False,
-    fp16: bool = False
+    fp16: bool = False,
+    text_frontend: bool = False
 ) -> List[str]:
     """
     生成多样化的音频样本，通过调整采样参数
@@ -32,10 +38,12 @@ def generate_diverse_samples(
         text: 要合成的文本
         reference_audio_path: 参考音频路径（说话人音频）
         output_dir: 输出目录
+        text_id: 文本唯一标识符
         num_samples: 要生成的样本数量
         sampling_params_list: 采样参数列表，每个元素是一个字典，包含采样参数
         stream: 是否使用流式处理
         fp16: 是否使用半精度计算
+        text_frontend: 是否使用文本前端处理
         
     Returns:
         生成的音频文件路径列表
@@ -64,43 +72,80 @@ def generate_diverse_samples(
     
     output_paths = []
     
+    # 初始化模型（只初始化一次）
+    cosyvoice = CosyVoice2(model_path, load_jit=False, load_trt=False, fp16=fp16)
+    
     # 对每组采样参数生成一个样本
     for i, sampling_params in enumerate(sampling_params_list[:num_samples]):
-        # 修改模型配置文件中的采样参数
-        model_config_path = os.path.join(model_path, "cosyvoice2.yaml")
-        modified_config_path = modify_sampling_params(model_config_path, sampling_params, i)
-        
-        # 使用修改后的配置初始化模型
-        cosyvoice = CosyVoice2(model_path, load_jit=False, load_trt=False, fp16=fp16, 
-                              config_path=modified_config_path)
-        
-        # 生成音频
-        output_path = os.path.join(output_dir, f"sample_{i}.wav")
+        # 设置输出路径
+        output_path = os.path.join(output_dir, f"{text_id}_{i}.wav")
         
         # 使用零样本合成
-        for j, output in enumerate(cosyvoice.inference_zero_shot(
-            text, 
-            "", # 空提示文本
-            reference_audio_16k, 
-            stream=stream,
-            text_frontend=False  # 使用与示例代码相同的设置
-        )):
-            if j > 0:
-                logging.warning(f"生成了多个音频片段，只保留第一个")
-                break
+        try:
+            # 修改模型的采样参数
+            modify_model_sampling_params(cosyvoice, sampling_params)
             
-            torchaudio.save(output_path, output['tts_speech'], cosyvoice.sample_rate)
-            output_paths.append(output_path)
-        
-        # 释放模型内存
-        del cosyvoice
-        torch.cuda.empty_cache()
-        
-        # 删除临时配置文件
-        if os.path.exists(modified_config_path):
-            os.remove(modified_config_path)
+            # 使用零样本合成
+            for j, output in enumerate(cosyvoice.inference_zero_shot(
+                text, 
+                "", # 空提示文本
+                reference_audio_16k, 
+                stream=stream,
+                text_frontend=text_frontend
+            )):
+                if j > 0:
+                    logging.warning(f"生成了多个音频片段，只保留第一个")
+                    break
+                
+                torchaudio.save(output_path, output['tts_speech'], cosyvoice.sample_rate)
+                output_paths.append(output_path)
+                
+            logging.info(f"使用参数 {sampling_params} 生成样本 {i}")
+        except Exception as e:
+            logging.error(f"生成样本 {i} 时出错: {str(e)}")
+    
+    # 释放模型内存
+    del cosyvoice
+    torch.cuda.empty_cache()
     
     return output_paths
+
+def modify_model_sampling_params(cosyvoice, sampling_params):
+    """
+    修改模型的采样参数
+    
+    Args:
+        cosyvoice: CosyVoice2模型实例
+        sampling_params: 采样参数字典
+    """
+    # 获取llm模型
+    llm = cosyvoice.model.llm
+    
+    # 修改采样参数
+    if hasattr(llm, 'sampling'):
+        for key, value in sampling_params.items():
+            if hasattr(llm.sampling, key):
+                setattr(llm.sampling, key, value)
+                logging.info(f"设置采样参数 {key} = {value}")
+            else:
+                logging.warning(f"采样参数 {key} 不存在")
+    else:
+        # 如果llm没有sampling属性，尝试在其他地方查找
+        found = False
+        for attr_name in dir(llm):
+            attr = getattr(llm, attr_name)
+            if hasattr(attr, 'sampling'):
+                for key, value in sampling_params.items():
+                    if hasattr(attr.sampling, key):
+                        setattr(attr.sampling, key, value)
+                        logging.info(f"在 {attr_name}.sampling 中设置参数 {key} = {value}")
+                        found = True
+                    else:
+                        logging.warning(f"在 {attr_name}.sampling 中未找到参数 {key}")
+                break
+        
+        if not found:
+            logging.warning("未找到采样参数的位置，无法修改采样参数")
 
 def generate_diverse_sampling_params(num_samples: int) -> List[Dict]:
     """
@@ -173,113 +218,145 @@ def generate_diverse_sampling_params(num_samples: int) -> List[Dict]:
     
     return params_list
 
-def modify_sampling_params(config_path: str, sampling_params: Dict, index: int) -> str:
-    """
-    修改模型配置文件中的采样参数
-    
-    Args:
-        config_path: 原始配置文件路径
-        sampling_params: 新的采样参数
-        index: 样本索引，用于生成唯一的配置文件名
-        
-    Returns:
-        修改后的配置文件路径
-    """
-    # 读取原始配置
-    with open(config_path, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    
-    # 修改采样参数
-    if 'llm' in config and 'sampling' in config['llm']:
-        # 深拷贝配置以避免修改原始对象
-        new_config = copy.deepcopy(config)
-        
-        # 更新采样参数
-        for key, value in sampling_params.items():
-            if key in new_config['llm']['sampling']:
-                new_config['llm']['sampling'][key] = value
-    else:
-        logging.warning("配置文件中未找到采样参数路径，将使用原始配置")
-        new_config = config
-    
-    # 保存修改后的配置
-    modified_config_path = f"{os.path.splitext(config_path)[0]}_modified_{index}.yaml"
-    with open(modified_config_path, 'w', encoding='utf-8') as f:
-        yaml.dump(new_config, f)
-    
-    return modified_config_path
-
-def dpo_sample_generation(
+def process_excel_for_dpo(
     model_path: str,
-    text_list: List[str],
-    reference_audio_path: str,
+    excel_path: str,
     output_base_dir: str,
     samples_per_text: int = 5,
-    sampling_params_list: List[Dict] = None,
+    sampling_params_list: Optional[List[Dict]] = None,
     stream: bool = False,
-    fp16: bool = False
-) -> Dict[str, List[str]]:
+    fp16: bool = False,
+    text_frontend: bool = False
+) -> Dict[str, Dict[str, List[str]]]:
     """
-    为DPO训练生成多样化的音频样本
+    处理Excel文件，为DPO训练生成多样化的音频样本
     
     Args:
         model_path: CosyVoice2 模型路径
-        text_list: 要合成的文本列表
-        reference_audio_path: 参考音频路径（说话人音频）
+        excel_path: Excel文件路径，包含text_id, text, speaker, reference_audio_path列
         output_base_dir: 输出基础目录
         samples_per_text: 每个文本要生成的样本数量
         sampling_params_list: 采样参数列表
         stream: 是否使用流式处理
         fp16: 是否使用半精度计算
+        text_frontend: 是否使用文本前端处理
         
     Returns:
-        文本到音频路径列表的映射
+        嵌套字典，格式为 {speaker: {text_id: [audio_paths]}}
     """
+    # 创建输出基础目录
+    os.makedirs(output_base_dir, exist_ok=True)
+    
+    # 读取Excel文件
+    if excel_path.endswith('.xlsx') or excel_path.endswith('.xls'):
+        df = pd.read_excel(excel_path)
+    elif excel_path.endswith('.csv'):
+        df = pd.read_csv(excel_path)
+    else:
+        raise ValueError(f"不支持的文件格式: {excel_path}")
+    
+    # 验证必要的列是否存在
+    required_columns = ['text_id', 'text', 'speaker', 'reference_audio_path']
+    for col in required_columns:
+        if col not in df.columns:
+            raise ValueError(f"Excel文件中缺少必要的列: {col}")
+    
     results = {}
     
-    for i, text in enumerate(text_list):
-        # 为每个文本创建一个子目录
-        text_dir = os.path.join(output_base_dir, f"text_{i}")
+    # 按speaker分组处理
+    for speaker, group in df.groupby('speaker'):
+        speaker_dir = os.path.join(output_base_dir, speaker)
+        os.makedirs(speaker_dir, exist_ok=True)
         
-        # 生成样本
-        audio_paths = generate_diverse_samples(
-            model_path=model_path,
-            text=text,
-            reference_audio_path=reference_audio_path,
-            output_dir=text_dir,
-            num_samples=samples_per_text,
-            sampling_params_list=sampling_params_list,
-            stream=stream,
-            fp16=fp16
-        )
+        speaker_results = {}
         
-        results[text] = audio_paths
-        logging.info(f"为文本 {i} 生成了 {len(audio_paths)} 个样本")
+        # 处理每个文本
+        for _, row in tqdm(group.iterrows(), total=len(group), desc=f"处理说话人 {speaker}"):
+            text_id = str(row['text_id'])
+            text = row['text']
+            reference_audio_path = row['reference_audio_path']
+            
+            # 创建text_id目录
+            text_dir = os.path.join(speaker_dir, text_id)
+            
+            # 生成样本
+            try:
+                audio_paths = generate_diverse_samples(
+                    model_path=model_path,
+                    text=text,
+                    reference_audio_path=reference_audio_path,
+                    output_dir=text_dir,
+                    text_id=text_id,
+                    num_samples=samples_per_text,
+                    sampling_params_list=sampling_params_list,
+                    stream=stream,
+                    fp16=fp16,
+                    text_frontend=text_frontend
+                )
+                
+                speaker_results[text_id] = audio_paths
+                logging.info(f"为说话人 {speaker} 的文本 {text_id} 生成了 {len(audio_paths)} 个样本")
+            except Exception as e:
+                logging.error(f"处理说话人 {speaker} 的文本 {text_id} 时出错: {str(e)}")
+        
+        results[speaker] = speaker_results
+    
+    # 保存采样参数到JSON文件
+    if sampling_params_list is not None:
+        params_file = os.path.join(output_base_dir, "sampling_params.json")
+        with open(params_file, 'w', encoding='utf-8') as f:
+            json.dump(sampling_params_list, f, indent=2, ensure_ascii=False)
     
     return results
 
-# 使用示例
-if __name__ == "__main__":
-    # 示例文本列表
-    texts = [
-        "这是一个用于测试的句子，希望能生成多样化的语音样本。",
-        "人工智能技术正在快速发展，语音合成质量越来越高。"
-    ]
+def main():
+    parser = argparse.ArgumentParser(description='为DPO训练生成多样化的CosyVoice2音频样本')
+    parser.add_argument('--model_path', type=str, required=True, help='CosyVoice2模型路径')
+    parser.add_argument('--excel_path', type=str, required=True, help='Excel文件路径')
+    parser.add_argument('--output_dir', type=str, required=True, help='输出目录')
+    parser.add_argument('--samples_per_text', type=int, default=5, help='每个文本生成的样本数量')
+    parser.add_argument('--stream', action='store_true', help='是否使用流式处理')
+    parser.add_argument('--fp16', action='store_true', help='是否使用半精度计算')
+    parser.add_argument('--text_frontend', action='store_true', help='是否使用文本前端处理')
+    parser.add_argument('--custom_params', type=str, default=None, help='自定义采样参数JSON文件路径')
     
-    # 生成样本
-    results = dpo_sample_generation(
-        model_path="pretrained_models/CosyVoice2-0.5B",
-        text_list=texts,
-        reference_audio_path="./asset/zero_shot_prompt.wav",
-        output_base_dir="./dpo_samples",
-        samples_per_text=5
+    args = parser.parse_args()
+    
+    # 加载自定义采样参数（如果提供）
+    sampling_params_list = None
+    if args.custom_params:
+        try:
+            with open(args.custom_params, 'r', encoding='utf-8') as f:
+                sampling_params_list = json.load(f)
+            logging.info(f"已加载自定义采样参数: {sampling_params_list}")
+        except Exception as e:
+            logging.error(f"加载自定义采样参数时出错: {str(e)}")
+            sampling_params_list = None
+    
+    # 处理Excel文件
+    results = process_excel_for_dpo(
+        model_path=args.model_path,
+        excel_path=args.excel_path,
+        output_base_dir=args.output_dir,
+        samples_per_text=args.samples_per_text,
+        sampling_params_list=sampling_params_list,
+        stream=args.stream,
+        fp16=args.fp16,
+        text_frontend=args.text_frontend
     )
     
-    # 打印结果
-    for text, paths in results.items():
-        print(f"文本: {text}")
-        print(f"生成的样本: {paths}")
-        print("---")
+    # 打印结果摘要
+    print("\n生成结果摘要:")
+    for speaker, speaker_results in results.items():
+        print(f"说话人 {speaker}:")
+        print(f"  处理的文本数量: {len(speaker_results)}")
+        total_samples = sum(len(paths) for paths in speaker_results.values())
+        print(f"  生成的样本总数: {total_samples}")
+    
+    print(f"\n所有样本已保存到: {args.output_dir}")
+
+if __name__ == "__main__":
+    main()
 ```
 
 ## 代码说明
