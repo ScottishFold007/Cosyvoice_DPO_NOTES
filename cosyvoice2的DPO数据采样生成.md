@@ -398,16 +398,24 @@ if __name__ == "__main__":
 
 
 
-# CosyVoice2 多样化音频生成代码 - 优化版
 
-以下是根据您的需求优化后的完整代码，支持从 Excel 文件读取数据，并按照指定的目录结构组织生成的音频文件：
+
+
+
+
+
+# CosyVoice2 多样化音频生成代码 - 优化版（支持采样参数）
+
+根据您提供的 `cosyvoice/cli/frontend.py` 代码，我现在了解了更多关于 CosyVoice2 的前端处理。我将修改之前的代码，使其能够有机地嵌入采样参数（"top_p", "top_k", "win_size", "tau_r"）。
+
+以下是优化后的完整代码：
 
 ```python
 import torch
 import torchaudio
 import numpy as np
 import pandas as pd
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Generator
 import os
 from cosyvoice.cli.cosyvoice import CosyVoice2
 from cosyvoice.utils.file_utils import logging
@@ -415,6 +423,7 @@ import yaml
 import copy
 import argparse
 from tqdm import tqdm
+import json
 
 def generate_diverse_samples(
     model_path: str,
@@ -425,7 +434,8 @@ def generate_diverse_samples(
     num_samples: int = 5,
     sampling_params_list: Optional[List[Dict]] = None,
     stream: bool = False,
-    fp16: bool = False
+    fp16: bool = False,
+    text_frontend: bool = False
 ) -> List[str]:
     """
     生成多样化的音频样本，通过调整采样参数
@@ -440,6 +450,7 @@ def generate_diverse_samples(
         sampling_params_list: 采样参数列表，每个元素是一个字典，包含采样参数
         stream: 是否使用流式处理
         fp16: 是否使用半精度计算
+        text_frontend: 是否使用文本前端处理
         
     Returns:
         生成的音频文件路径列表
@@ -478,15 +489,16 @@ def generate_diverse_samples(
         
         # 使用零样本合成
         try:
-            # 注意：这里我们没有修改配置文件，而是直接使用模型
-            # 在实际应用中，您可能需要找到一种方法来动态修改模型的采样参数
+            # 修改模型的采样参数
+            modify_model_sampling_params(cosyvoice, sampling_params)
+            
+            # 使用零样本合成
             for j, output in enumerate(cosyvoice.inference_zero_shot(
                 text, 
                 "", # 空提示文本
                 reference_audio_16k, 
                 stream=stream,
-                text_frontend=False,  # 使用与示例代码相同的设置
-                sampling_params=sampling_params  # 假设模型支持直接传入采样参数
+                text_frontend=text_frontend
             )):
                 if j > 0:
                     logging.warning(f"生成了多个音频片段，只保留第一个")
@@ -494,6 +506,8 @@ def generate_diverse_samples(
                 
                 torchaudio.save(output_path, output['tts_speech'], cosyvoice.sample_rate)
                 output_paths.append(output_path)
+                
+            logging.info(f"使用参数 {sampling_params} 生成样本 {i}")
         except Exception as e:
             logging.error(f"生成样本 {i} 时出错: {str(e)}")
     
@@ -502,6 +516,43 @@ def generate_diverse_samples(
     torch.cuda.empty_cache()
     
     return output_paths
+
+def modify_model_sampling_params(cosyvoice, sampling_params):
+    """
+    修改模型的采样参数
+    
+    Args:
+        cosyvoice: CosyVoice2模型实例
+        sampling_params: 采样参数字典
+    """
+    # 获取llm模型
+    llm = cosyvoice.model.llm
+    
+    # 修改采样参数
+    if hasattr(llm, 'sampling'):
+        for key, value in sampling_params.items():
+            if hasattr(llm.sampling, key):
+                setattr(llm.sampling, key, value)
+                logging.info(f"设置采样参数 {key} = {value}")
+            else:
+                logging.warning(f"采样参数 {key} 不存在")
+    else:
+        # 如果llm没有sampling属性，尝试在其他地方查找
+        found = False
+        for attr_name in dir(llm):
+            attr = getattr(llm, attr_name)
+            if hasattr(attr, 'sampling'):
+                for key, value in sampling_params.items():
+                    if hasattr(attr.sampling, key):
+                        setattr(attr.sampling, key, value)
+                        logging.info(f"在 {attr_name}.sampling 中设置参数 {key} = {value}")
+                        found = True
+                    else:
+                        logging.warning(f"在 {attr_name}.sampling 中未找到参数 {key}")
+                break
+        
+        if not found:
+            logging.warning("未找到采样参数的位置，无法修改采样参数")
 
 def generate_diverse_sampling_params(num_samples: int) -> List[Dict]:
     """
@@ -581,7 +632,8 @@ def process_excel_for_dpo(
     samples_per_text: int = 5,
     sampling_params_list: Optional[List[Dict]] = None,
     stream: bool = False,
-    fp16: bool = False
+    fp16: bool = False,
+    text_frontend: bool = False
 ) -> Dict[str, Dict[str, List[str]]]:
     """
     处理Excel文件，为DPO训练生成多样化的音频样本
@@ -594,6 +646,7 @@ def process_excel_for_dpo(
         sampling_params_list: 采样参数列表
         stream: 是否使用流式处理
         fp16: 是否使用半精度计算
+        text_frontend: 是否使用文本前端处理
         
     Returns:
         嵌套字典，格式为 {speaker: {text_id: [audio_paths]}}
@@ -644,7 +697,8 @@ def process_excel_for_dpo(
                     num_samples=samples_per_text,
                     sampling_params_list=sampling_params_list,
                     stream=stream,
-                    fp16=fp16
+                    fp16=fp16,
+                    text_frontend=text_frontend
                 )
                 
                 speaker_results[text_id] = audio_paths
@@ -654,43 +708,13 @@ def process_excel_for_dpo(
         
         results[speaker] = speaker_results
     
+    # 保存采样参数到JSON文件
+    if sampling_params_list is not None:
+        params_file = os.path.join(output_base_dir, "sampling_params.json")
+        with open(params_file, 'w', encoding='utf-8') as f:
+            json.dump(sampling_params_list, f, indent=2, ensure_ascii=False)
+    
     return results
-
-def patch_cosyvoice2_for_sampling_params():
-    """
-    为CosyVoice2类添加支持直接传入采样参数的功能
-    
-    注意：这是一个猴子补丁，用于修改CosyVoice2类的行为
-    在实际应用中，您可能需要直接修改CosyVoice2的源代码
-    """
-    # 保存原始的inference_zero_shot方法
-    original_inference_zero_shot = CosyVoice2.inference_zero_shot
-    
-    # 定义新的方法，支持sampling_params参数
-    def patched_inference_zero_shot(self, tts_text, prompt_text, prompt_speech_16k, stream=False, speed=1.0, text_frontend=True, sampling_params=None):
-        # 如果提供了sampling_params，临时修改模型的采样参数
-        if sampling_params is not None:
-            # 保存原始参数
-            original_params = {}
-            if hasattr(self.model.llm, 'sampling'):
-                for key, value in sampling_params.items():
-                    if hasattr(self.model.llm.sampling, key):
-                        original_params[key] = getattr(self.model.llm.sampling, key)
-                        setattr(self.model.llm.sampling, key, value)
-        
-        # 调用原始方法
-        result = original_inference_zero_shot(self, tts_text, prompt_text, prompt_speech_16k, stream, speed, text_frontend)
-        
-        # 如果修改了参数，恢复原始参数
-        if sampling_params is not None and hasattr(self.model.llm, 'sampling'):
-            for key, value in original_params.items():
-                if hasattr(self.model.llm.sampling, key):
-                    setattr(self.model.llm.sampling, key, value)
-        
-        return result
-    
-    # 替换方法
-    CosyVoice2.inference_zero_shot = patched_inference_zero_shot
 
 def main():
     parser = argparse.ArgumentParser(description='为DPO训练生成多样化的CosyVoice2音频样本')
@@ -700,11 +724,21 @@ def main():
     parser.add_argument('--samples_per_text', type=int, default=5, help='每个文本生成的样本数量')
     parser.add_argument('--stream', action='store_true', help='是否使用流式处理')
     parser.add_argument('--fp16', action='store_true', help='是否使用半精度计算')
+    parser.add_argument('--text_frontend', action='store_true', help='是否使用文本前端处理')
+    parser.add_argument('--custom_params', type=str, default=None, help='自定义采样参数JSON文件路径')
     
     args = parser.parse_args()
     
-    # 应用猴子补丁，使CosyVoice2支持直接传入采样参数
-    patch_cosyvoice2_for_sampling_params()
+    # 加载自定义采样参数（如果提供）
+    sampling_params_list = None
+    if args.custom_params:
+        try:
+            with open(args.custom_params, 'r', encoding='utf-8') as f:
+                sampling_params_list = json.load(f)
+            logging.info(f"已加载自定义采样参数: {sampling_params_list}")
+        except Exception as e:
+            logging.error(f"加载自定义采样参数时出错: {str(e)}")
+            sampling_params_list = None
     
     # 处理Excel文件
     results = process_excel_for_dpo(
@@ -712,8 +746,10 @@ def main():
         excel_path=args.excel_path,
         output_base_dir=args.output_dir,
         samples_per_text=args.samples_per_text,
+        sampling_params_list=sampling_params_list,
         stream=args.stream,
-        fp16=args.fp16
+        fp16=args.fp16,
+        text_frontend=args.text_frontend
     )
     
     # 打印结果摘要
@@ -730,6 +766,25 @@ if __name__ == "__main__":
     main()
 ```
 
+
+## 主要改进
+
+1. **直接修改模型采样参数**：
+   - 添加了 `modify_model_sampling_params` 函数，直接修改模型的采样参数
+   - 该函数会尝试在模型的不同位置查找采样参数，以适应不同的模型结构
+
+2. **更灵活的参数控制**：
+   - 支持从JSON文件加载自定义采样参数
+   - 保存使用的采样参数到输出目录，便于后续分析
+
+3. **前端处理选项**：
+   - 添加了 `text_frontend` 参数，控制是否使用文本前端处理
+   - 根据 `frontend.py` 中的代码，默认设置为 False，与示例代码保持一致
+
+4. **更好的错误处理**：
+   - 增强了错误处理和日志记录
+   - 即使某个样本生成失败，也会继续处理其他样本
+
 ## 使用方法
 
 1. 将代码保存为 `generate_dpo_samples.py`
@@ -740,16 +795,44 @@ if __name__ == "__main__":
 python generate_dpo_samples.py --model_path pretrained_models/CosyVoice2-0.5B --excel_path your_data.xlsx --output_dir ./dpo_samples --samples_per_text 5
 ```
 
-## 代码说明
+4. 如果要使用自定义采样参数，可以创建一个JSON文件，例如：
 
-1. **主要功能**:
-   - 从Excel文件读取数据
-   - 按照指定的目录结构组织输出（speaker/text_id/text_id_数字编号.wav）
-   - 为每个文本生成多个具有不同采样参数的音频样本
+```json
+[
+  {
+    "top_p": 0.8,
+    "top_k": 25,
+    "win_size": 10,
+    "tau_r": 0.1
+  },
+  {
+    "top_p": 0.95,
+    "top_k": 50,
+    "win_size": 15,
+    "tau_r": 0.2
+  }
+]
+```
 
-2. **目录结构**:
+然后使用 `--custom_params` 参数指定该文件：
+
+```bash
+python generate_dpo_samples.py --model_path pretrained_models/CosyVoice2-0.5B --excel_path your_data.xlsx --output_dir ./dpo_samples --samples_per_text 5 --custom_params custom_params.json
+```
+
+## 注意事项
+
+1. 代码假设可以直接修改模型的采样参数。如果模型结构与预期不同，可能需要调整 `modify_model_sampling_params` 函数。
+
+2. 根据 `frontend.py` 的代码，我们默认设置 `text_frontend=False`，这与示例代码中的注释一致：
+   ```python
+   # NOTE if you want to reproduce the results on https://funaudiollm.github.io/cosyvoice2, please add text_frontend=False during inference
+   ```
+
+3. 生成的目录结构如下：
    ```
    output_dir/
+   ├── sampling_params.json
    ├── speaker1/
    │   ├── text_id1/
    │   │   ├── text_id1_0.wav
@@ -764,24 +847,17 @@ python generate_dpo_samples.py --model_path pretrained_models/CosyVoice2-0.5B --
    └── ...
    ```
 
-3. **关键改进**:
-   - 添加了猴子补丁，使CosyVoice2支持直接传入采样参数
-   - 按照speaker和text_id组织输出目录结构
-   - 支持从Excel/CSV文件读取数据
-   - 添加了命令行参数支持
-   - 使用tqdm显示进度条
-   - 增强了错误处理和日志记录
+这个优化版本的代码应该能够满足您的需求，有机地嵌入采样参数到生成过程中，并按照指定的目录结构组织生成的音频文件。
 
-4. **注意事项**:
-   - 猴子补丁是一种临时解决方案，在实际应用中，您可能需要直接修改CosyVoice2的源代码
-   - 代码假设CosyVoice2类的inference_zero_shot方法可以接受sampling_params参数，如果不支持，您需要修改源代码
 
-## 使用建议
+   
 
-1. 确保Excel文件中的reference_audio_path列包含有效的音频文件路径
-2. 对于大量数据，考虑分批处理，以避免内存问题
-3. 如果遇到GPU内存不足的问题，可以尝试使用fp16模式（添加--fp16参数）
-4. 生成样本后，您可以手动或使用自动评分系统为每个样本打分，然后选择最好和最差的样本用于DPO训练
+    
+       
+        
+         
+                
 
-这个优化版本的代码应该能够满足您的需求，按照指定的目录结构组织生成的音频文件，并支持从Excel文件读取数据。
-
+    
+  
+    
