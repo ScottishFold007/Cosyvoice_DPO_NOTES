@@ -406,7 +406,7 @@ if __name__ == "__main__":
 
 # CosyVoice2 多样化音频生成代码 - 优化版（支持采样参数）
 
-根据您提供的 `cosyvoice/cli/frontend.py` 代码，我现在了解了更多关于 CosyVoice2 的前端处理。我将修改之前的代码，使其能够有机地嵌入采样参数（"top_p", "top_k", "win_size", "tau_r"）。
+基于 `cosyvoice/cli/frontend.py` 代码，在其中有机地嵌入采样参数（"top_p", "top_k", "win_size", "tau_r"），以便灵活调控这些参数进行音频采样生成。
 
 以下是优化后的完整代码：
 
