@@ -8,7 +8,7 @@
 
 # CosyVoice2 DPO训练数据准备完整流程
 
-根据您提供的所有代码，我现在可以更全面地理解CosyVoice2的DPO训练数据准备流程。下面我将详细分析`processor_dpo.py`的功能，并提供一个完整的DPO训练数据准备方案。
+
 
 ## processor_dpo.py 分析
 
