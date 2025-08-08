@@ -32,7 +32,3 @@ Clone this repo, dive into the code, and start experimenting with CosyVoice’s 
 🎧 **Demos**: Check out CosyVoice’s demos at https://funaudiollm.github.io/cosyvoice2  
 
 Let’s make synthetic voices sound more human than ever! 🎙️
-
-- **行动号召**：鼓励用户克隆仓库、参与社区，并提供相关链接和资源。
-
-如果需要更简短或更技术化的版本，请告诉我！
