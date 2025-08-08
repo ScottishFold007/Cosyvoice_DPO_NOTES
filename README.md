@@ -28,7 +28,7 @@ Welcome to **CosyVoice_DPO_NOTES**, the go-to resource for TTS practitioners loo
 Clone this repo, dive into the code, and start experimenting with CosyVoice’s pretrained models (`CosyVoice2-0.5B`, `CosyVoice-300M-SFT`, etc.) available on Hugging Face or ModelScope. Join the conversation on GitHub Issues to share your tweaks or ask for help. Whether you’re crafting a multilingual chatbot or a next-gen audiobook narrator, **CosyVoice_DPO_NOTES** is your shortcut to TTS excellence! 🚀
 
 🔗 **[Repo](https://github.com/ScottishFold007/Cosyvoice_DPO_NOTES) ** 
-📚 **Inspired by**: [CosyVoice 2](arXiv:2412.10117) & [CosyVoice 3](arXiv:2505.16736)  
+📚 **Inspired by**: [CosyVoice 2](https://arxiv.org/abs/2412.10117) & [CosyVoice 3](https://arxiv.org/abs/2505.17589)  
 🎧 **Demos**: Check out [CosyVoice’s demos](https://funaudiollm.github.io/cosyvoice2)
 
 Let’s make synthetic voices sound more human than ever! 🎙️
