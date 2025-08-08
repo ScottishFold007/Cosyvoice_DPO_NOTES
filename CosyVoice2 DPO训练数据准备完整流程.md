@@ -519,4 +519,4 @@ python prepare_all_dpo_data.py --model_path pretrained_models/CosyVoice2-0.5B --
 
 8. **模型保存**：定期保存训练中的模型检查点，以便在需要时恢复训练或选择最佳模型。
 
-通过这个完整的流程，您应该能够准备高质量的DPO训练数据，为CosyVoice2模型的进一步优化提供基础。
+通过这个完整的流程，可以准备高质量的DPO训练数据，为CosyVoice2模型的进一步优化提供坚实的数据基础。
